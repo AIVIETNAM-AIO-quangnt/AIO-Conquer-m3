@@ -1,0 +1,88 @@
+# Remote-export collector config: same receivers/processors as collector.local.yaml,
+# routed to the remote Grafana stack (Prometheus + Loki/Tempo) instead of debug.
+# Selected via C3_OTEL_COLLECTOR_CONFIG=collector.remote.yaml once the remote
+# addresses are known.
+#
+# `${env:VAR}` is the collector's environment-substitution syntax; every address and
+# credential here comes from .env, so this file never hardcodes an endpoint.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: conquer3-bentoml
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["bentoml:3000"]
+        - job_name: otel-collector-self
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["localhost:8888"]
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+  resourcedetection:
+    detectors: [env, system]
+    system:
+      hostname_sources: [os]
+  attributes/strip_account_id:
+    actions:
+      - key: account_id
+        action: delete
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  basicauth/prometheus:
+    client_auth:
+      username: ${env:C3_PROM_REMOTE_WRITE_USER}
+      password: ${env:C3_PROM_REMOTE_WRITE_PASSWORD}
+  basicauth/loki:
+    client_auth:
+      username: ${env:C3_LOKI_USER}
+      password: ${env:C3_LOKI_PASSWORD}
+
+exporters:
+  prometheusremotewrite:
+    endpoint: ${env:C3_PROM_REMOTE_WRITE_URL}
+    auth:
+      authenticator: basicauth/prometheus
+  otlp/tempo:
+    endpoint: ${env:C3_OTLP_TEMPO_ENDPOINT}
+  otlphttp/loki:
+    endpoint: ${env:C3_LOKI_ENDPOINT}
+    auth:
+      authenticator: basicauth/loki
+  # Kept alongside the remote exporters (not a replacement for them) so a
+  # misconfigured remote endpoint shows up as a connection error in THIS
+  # container's log, never as a silent drop -- see the Layer 7 gate.
+  debug:
+    verbosity: normal
+
+service:
+  extensions: [health_check, basicauth/prometheus, basicauth/loki]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlp/tempo, debug]
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, resourcedetection, attributes/strip_account_id, batch]
+      exporters: [prometheusremotewrite, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [otlphttp/loki, debug]

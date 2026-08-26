@@ -1,0 +1,320 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.1
+  profiles: [pipeline]
+  env_file:
+    - .env
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # The complete connection URI can be overridden from the shell or .env.
+    # The default uses the credentials configured on airflow-postgres below.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: "${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow}"
+    # Empty by default = encryption disabled, which is fine for local dev.
+    # scripts/bootstrap.sh generates a real one into .env on first run. A non-empty
+    # value MUST be a valid Fernet key (32 url-safe base64-encoded bytes) -- a plain
+    # placeholder string like "key" makes Airflow crash on startup
+    # (cryptography.fernet.Fernet rejects it immediately).
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:-}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:8080/execution/"
+    # Local-dev-only default. scripts/bootstrap.sh generates a real one into .env;
+    # this fallback exists only so the stack still starts if that step was skipped.
+    AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW__API_AUTH__JWT_SECRET:-insecure-local-dev-secret-change-me}"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
+  # MUST default to 50000: the base image bakes in a real `airflow` user at exactly
+  # that UID (with HOME=/home/airflow) at build time. airflow-init below overrides
+  # `entrypoint:` to run a raw script directly, bypassing the image's own
+  # `/entrypoint` (which is what normally sets HOME/PYTHONPATH correctly for an
+  # arbitrary UID). Any UID other than 50000 has no matching /etc/passwd entry in
+  # that case, HOME never resolves to /home/airflow, and every `airflow` command
+  # fails with "ModuleNotFoundError: No module named 'airflow'" even though the
+  # package is installed and present on disk.
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks: [c3net]
+  depends_on: &airflow-common-depends-on
+    airflow-postgres:
+      condition: service_healthy
+
+networks:
+  c3net:
+    name: c3net
+
+volumes:
+  pgdata:
+  airflowdb:
+  redisdata:
+  events:
+  staging:
+  modelcache:
+  pathwaystate:
+  duckdbdata:
+
+services:
+  # ─────────────────────────────── core ───────────────────────────────
+  postgres:
+    image: postgres:17-alpine
+    profiles: [core]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-conquer3}
+      POSTGRES_USER: ${POSTGRES_USER:-conquer3}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Layer 2 adds the real schema/table DDL here; empty for now (see .gitkeep).
+      - ./src/conquer3/db/ddl:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conquer3} -d ${POSTGRES_DB:-conquer3}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [c3net]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    profiles: [core]
+    # noeviction, not allkeys-lru: evicting an account's state key under memory
+    # pressure silently turns a returning customer into a cold start with no error
+    # anywhere. Growth is capped by C3_STATE_TTL_DAYS instead -- see state_store.py
+    # (Layer 5) -- and a miss-ratio alert, not by letting Redis evict at random.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks: [c3net]
+    restart: unless-stopped
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.127.0
+    profiles: [core]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./docker/otel/${C3_OTEL_COLLECTOR_CONFIG:-collector.local.yaml}:/etc/otelcol-contrib/config.yaml:ro
+    env_file:
+      - .env
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+      - "13133:13133" # health_check extension
+    networks: [c3net]
+    restart: unless-stopped
+    # No container HEALTHCHECK: the contrib image is a distroless-style build with
+    # no shell/curl to exec one against. scripts/smoke/layer1_infra.sh instead polls
+    # :13133 from the host, which is exactly what the Layer 1 gate specifies.
+
+  adminer:
+    image: adminer:latest
+    profiles: [tools]
+    ports:
+      - "8081:8080"
+    networks: [c3net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ────────────────────────────── pipeline ──────────────────────────────
+  # Airflow's OWN metadata store -- separate from the `postgres` warehouse above by
+  # design, so Airflow's internal state can never collide with medallion data.
+  airflow-postgres:
+    image: postgres:17-alpine
+    profiles: [pipeline]
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      # Must match the credentials in the default Airflow connection URI above.
+      POSTGRES_PASSWORD: airflow
+    volumes:
+      - airflowdb:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks: [c3net]
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    # Do NOT call `airflow db migrate` (or any `airflow` subcommand) directly from
+    # this bash script -- the image's real ENTRYPOINT (/entrypoint) is what sets up
+    # HOME and PYTHONPATH correctly for whichever UID the container runs as
+    # (including root's PYTHONPATH-specific workaround, since Python disables
+    # user-site packages entirely for EUID 0). Skipping it is exactly what produces
+    # "ModuleNotFoundError: No module named 'airflow'" despite the package being on
+    # disk. Instead: do the plain-coreutils setup here, then `exec /entrypoint` with
+    # zero arguments -- which, combined with _AIRFLOW_DB_MIGRATE/
+    # _AIRFLOW_WWW_USER_CREATE below, runs the real migrate+create-user logic
+    # in-process and exits 0. See scripts/docker/entrypoint_prod.sh in apache/airflow.
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        mkdir -v -p /opt/airflow/logs
+        exec /entrypoint
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      # _AIRFLOW_WWW_USER_USERNAME / _AIRFLOW_WWW_USER_PASSWORD come from .env via
+      # env_file above -- no need to redeclare them here with interpolation.
+    # root, matching upstream's own reference file: db migrate on a brand-new volume
+    # and the log-directory creation both benefit from not being UID-restricted on
+    # first run. Every other airflow-* service runs as the AIRFLOW_UID (50000)
+    # inherited from the anchor above.
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    # LocalExecutor forks task subprocesses under the SCHEDULER, not the apiserver --
+    # so this is the service that needs the warehouse-adjacent volumes tasks read
+    # and write (staging exports, the DuckDB file, the read-only event log, and the
+    # local PaySim CSV cache).
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/airflow/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/airflow/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/airflow/logs:/opt/airflow/logs
+      - staging:/staging
+      - duckdbdata:/duckdb
+      - events:/events:ro
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # ─────────────────────────────── stream ───────────────────────────────
+  pathway:
+    build:
+      context: .
+      dockerfile: docker/pathway.Dockerfile
+    profiles: [stream]
+    env_file:
+      - .env
+    volumes:
+      - events:/events:ro
+      - staging:/staging:ro
+      - pathwaystate:/pathway-state
+    networks: [c3net]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Entry point lands in Layer 3b (pipelines/pathway/run_backfill.py,
+    # run_streaming.py). Builds and installs cleanly today; nothing to run yet.
+
+  # ─────────────────────────────── serving ───────────────────────────────
+  bentoml:
+    build:
+      context: .
+      dockerfile: docker/serving.Dockerfile
+    profiles: [serving]
+    env_file:
+      - .env
+    ports:
+      - "${BENTOML_PORT:-3000}:3000"
+    volumes:
+      - events:/events
+      - modelcache:/models
+    networks: [c3net]
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    # Service code lands in Layer 5 (serving/service.py, bentofile.yaml).
+
+  # ──────────────────────────────── demo ────────────────────────────────
+  producer:
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+    profiles: [demo]
+    env_file:
+      - .env
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/data:/data:ro
+    networks: [c3net]
+    depends_on:
+      bentoml:
+        condition: service_healthy
+    # Entry point lands in Layer 5 (producer/replay.py).

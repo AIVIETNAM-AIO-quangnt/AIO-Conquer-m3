@@ -1,0 +1,2 @@
+Bind-mounted into every airflow-* container as /opt/airflow/plugins. Empty for
+now -- no custom Airflow plugins exist yet.

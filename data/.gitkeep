@@ -1,0 +1,4 @@
+Local cache for the PaySim CSV and any DuckDB scratch files. Bind-mounted into the
+airflow-scheduler and producer containers as /data. Contents are gitignored; only
+this placeholder is tracked so the directory exists before the first `docker compose
+up`.
