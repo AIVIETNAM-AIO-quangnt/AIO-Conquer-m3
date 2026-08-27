@@ -97,6 +97,7 @@ forbidden_modules = [
   "joblib", "psycopg", "opentelemetry",
   "conquer3.config", "conquer3.db", "conquer3.serving",
   "conquer3.pipelines", "conquer3.contracts", "conquer3.telemetry",
+  "conquer3.redis_scripts",
 ]
 
 [[tool.importlinter.contracts]]
@@ -132,7 +133,7 @@ layers = [
   "conquer3.contracts",
   "conquer3.telemetry",
   "conquer3.config",
-  "conquer3.core",
+  "conquer3.core | conquer3.redis_scripts",
 ]
 exhaustive = false
 
@@ -166,6 +167,7 @@ addopts = "-q --strict-markers"
 markers = [
   "slow: builds an isolated venv or touches large data",
   "integration: needs docker-compose services running",
+  "pathway: spawns a real pw.run() in its own subprocess; slow, one-shot per process",
 ]
 
 [tool.coverage.run]

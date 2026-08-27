@@ -11,6 +11,6 @@ COPY src ./src
 
 RUN pip install --no-cache-dir ".[stream]"
 
-# Entry points land in Layer 3b: pipelines/pathway/run_backfill.py (static mode) and
+# Layer 3b: pipelines/pathway/run_backfill.py (static mode) and
 # pipelines/pathway/run_streaming.py (streaming mode), selected by C3_PATHWAY_MODE.
-CMD ["python", "-m", "conquer3.cli", "version"]
+CMD ["sh", "-c", "if [ \"$C3_PATHWAY_MODE\" = \"static\" ]; then exec python -m conquer3.pipelines.pathway.run_backfill; else exec python -m conquer3.pipelines.pathway.run_streaming; fi"]

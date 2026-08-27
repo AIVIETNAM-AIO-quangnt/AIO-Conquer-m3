@@ -97,6 +97,26 @@ def _cmd_transform_silver_to_gold(_: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_transform_export_staging(_: argparse.Namespace) -> int:
+    from conquer3.pipelines.transforms.export_staging import export_staging
+
+    row_count = export_staging()
+    print(f"staging/ctx\t{row_count} rows")
+    return 0
+
+
+def _cmd_pathway_backfill(_: argparse.Namespace) -> int:
+    from conquer3.pipelines.pathway.run_backfill import main as run_backfill_main
+
+    return run_backfill_main()
+
+
+def _cmd_pathway_streaming(_: argparse.Namespace) -> int:
+    from conquer3.pipelines.pathway.run_streaming import main as run_streaming_main
+
+    return run_streaming_main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="conquer3", description="Credit-fraud MLOps platform")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -143,6 +163,18 @@ def build_parser() -> argparse.ArgumentParser:
     transform_sub.add_parser(
         "silver-to-gold", help="compute features from silver.txn into gold.txn_features"
     ).set_defaults(handler=_cmd_transform_silver_to_gold)
+    transform_sub.add_parser(
+        "export-staging", help="export silver.txn to JSONL staging for Pathway"
+    ).set_defaults(handler=_cmd_transform_export_staging)
+
+    pathway = sub.add_parser("pathway", help="Pathway feature engine (Layer 3b)")
+    pathway_sub = pathway.add_subparsers(dest="pathway_command", required=True)
+    pathway_sub.add_parser(
+        "backfill", help="static-mode: fold the staging snapshot once into account state"
+    ).set_defaults(handler=_cmd_pathway_backfill)
+    pathway_sub.add_parser(
+        "streaming", help="streaming-mode: continuously repair account state"
+    ).set_defaults(handler=_cmd_pathway_streaming)
 
     return parser
 

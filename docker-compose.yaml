@@ -275,8 +275,11 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-    # Entry point lands in Layer 3b (pipelines/pathway/run_backfill.py,
-    # run_streaming.py). Builds and installs cleanly today; nothing to run yet.
+    # Layer 3b: pipelines/pathway/run_backfill.py (static mode) and
+    # run_streaming.py (streaming mode), selected by C3_PATHWAY_MODE (see
+    # docker/pathway.Dockerfile's CMD). staging is read-only here -- only
+    # `conquer3 transform export-staging` (host CLI today; an Airflow task from
+    # Layer 6) writes it.
 
   # ─────────────────────────────── serving ───────────────────────────────
   bentoml:

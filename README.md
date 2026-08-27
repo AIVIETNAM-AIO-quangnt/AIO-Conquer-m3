@@ -19,8 +19,8 @@ pass before the next one starts.
 | 0 — Skeleton | `conquer3.core` feature engine, import boundaries, tooling | ✅ Done — `scripts/smoke/layer0_skeleton.sh` |
 | 1 — Infra | Docker Compose: Postgres, Redis, OTel Collector, Airflow | ✅ Running — `scripts/smoke/layer1_infra.sh` |
 | 2 — Warehouse | Postgres medallion schema (bronze/silver/gold), DuckDB+Ibis transforms | ✅ Done — `scripts/smoke/layer2_warehouse.sh` |
-| 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done |
-| 3b — Pathway | Batch backfill + streaming state repair | ⬜ Not started |
+| 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done — `scripts/smoke/layer3_feature_core.sh` |
+| 3b — Pathway | Batch backfill + streaming state repair | ✅ Done — `scripts/smoke/layer3b_pathway.sh` |
 | 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ⬜ Not started |
 | 5 — Serving | BentoML service, Redis state store, event sink | ⬜ Not started |
 | 6 — Airflow DAGs | Bootstrap/ingest/medallion/DQ/skew-audit/champion-watch DAGs | ⬜ Not started (only the `hello_world` smoke DAG exists) |
@@ -34,7 +34,13 @@ a working Airflow install that successfully parses and runs a smoke-test DAG, an
 Layer 2 warehouse -- `conquer3 ingest bronze` / `conquer3 transform bronze-to-silver` /
 `conquer3 transform silver-to-gold` load a PaySim1 CSV through the full medallion
 pipeline into `gold.txn_features`, computing every feature via `conquer3.core.features`
-(never in SQL) so it's provably the same code path serving and Colab use.
+(never in SQL) so it's provably the same code path serving and Colab use. The
+Pathway feature engine (`conquer3 transform export-staging` / `conquer3 pathway
+backfill` / `conquer3 pathway streaming`) folds the same `TransactionEvent` stream
+into per-account state via a custom reducer that delegates to `core.features.
+advance_state`/`merge_states`, mirroring it to Redis (through a shared monotonic-CAS
+Lua script) and to `gold.account_state`, via either the licensed `pw.io.postgres.write`
+connector or a CAS-guarded psycopg fallback -- both proven to agree exactly.
 
 ## Prerequisites
 
@@ -80,7 +86,7 @@ Nothing starts unless you pick a profile — there's no default "just run
 |---|---|---|
 | `core` | `postgres`, `redis`, `otel-collector` | Needed by everything else |
 | `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, separate from the `postgres` warehouse) |
-| `stream` | `pathway` | Feature engine (Layer 3b — builds today, nothing to run yet) |
+| `stream` | `pathway` | Feature engine (Layer 3b — static backfill + streaming state repair) |
 | `serving` | `bentoml` | Scoring API (Layer 5 — builds today, nothing to serve yet) |
 | `demo` | `producer` | Transaction replay driver (Layer 5) |
 | `tools` | `adminer` | Postgres UI at http://localhost:8081 |
@@ -112,6 +118,18 @@ docker compose config --quiet && echo "config OK"
 # extracts a sibling .zip if one's present, else downloads it (PaySim1 is public,
 # no Kaggle credentials needed).
 ./scripts/smoke/layer2_warehouse.sh
+
+# Layer 3 gate: golden vectors, cold-start policy, the Hypothesis
+# merge-associativity property test, and an exact-equality 100k-row Python/DuckDB
+# parity sweep for derive_event_ts_us. No Docker needed -- conquer3.core is
+# dependency-light by construction.
+./scripts/smoke/layer3_feature_core.sh
+
+# Layer 3b gate: static backfill row-count parity, licensed-connector-vs-psycopg-
+# fallback output parity, streaming pickup latency (< 2s), and kill/restart
+# deduplication -- all via pytest + ephemeral testcontainers Postgres/Redis, so it
+# never touches (or needs) the real docker-compose stack.
+./scripts/smoke/layer3b_pathway.sh
 ```
 
 Ad hoc:
@@ -135,7 +153,11 @@ src/conquer3/
 ├── config/         # settings.py -- the ONLY place env vars are read
 ├── telemetry/      # otel.py -- no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 ├── db/             # Postgres + DuckDB/Ibis engine, and db/ddl/*.sql -- Layer 2
-├── pipelines/       # ingest/ + transforms/ (Layer 2, done); pathway/ (Layer 3b, not built yet)
+├── redis_scripts/  # monotonic_cas.lua -- shared by Pathway (Layer 3b) and
+│                  # BentoML (Layer 5, not built yet), so both write through the
+│                  # exact same CAS semantics by construction
+├── pipelines/       # ingest/ + transforms/ (Layer 2 + export_staging.py for
+│                  # Layer 3b, done); pathway/ (Layer 3b, done)
 ├── serving/        # BentoML service -- Layer 5, not built yet
 ├── producer/       # transaction replay driver -- Layer 5, not built yet
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
@@ -167,7 +189,7 @@ extra:
 | `train` | scikit-learn, pandas, kagglehub, mlflow | Colab notebook (Layer 8) |
 | `serving` | bentoml, redis, mlflow, scikit-learn | `serving/` (Layer 5) |
 | `pipeline` | ibis, duckdb, polars, psycopg | `db/`, `pipelines/` (Layer 2) |
-| `stream` | pathway, redis, psycopg | `pipelines/pathway/` (Layer 3b) |
+| `stream` | pathway, redis, psycopg | `pipelines/pathway/` (Layer 3b, done) |
 | `registry` | mlflow (full, not `-skinny`) | `contracts/model_registry.py` |
 
 `uv sync --all-extras` installs everything for local development. Each Docker image
@@ -191,8 +213,23 @@ installs only what it needs — see `docker/*.Dockerfile`.
 - **`AIRFLOW__CORE__FERNET_KEY` must be empty or a real 32-byte urlsafe-base64
   Fernet key** — never a placeholder string. `scripts/bootstrap.sh` generates a
   real one into `.env` on first run.
-- Pathway (`stream` profile) and BentoML (`serving` profile) containers build and
-  install cleanly today but have no entry point yet — Layers 3b and 5.
+- BentoML (`serving` profile) container builds and installs cleanly today but has
+  no entry point yet — Layer 5. Pathway (`stream` profile) is wired up (Layer 3b).
+- **`gold.account_state.state_json` is `TEXT`, not `JSONB`**, even though it holds
+  serialized JSON. Confirmed empirically: the licensed `pw.io.postgres.write`
+  connector's Rust driver refuses to write a Pathway `str` column into a `JSONB`
+  destination ("declared Pathway type 'str' is not compatible with PostgreSQL type
+  'jsonb'"), and there's no way to add an explicit cast through that connector's
+  API. `TEXT` is what both the licensed connector and the psycopg fallback agree
+  on. Costs native `->>'field'` querying; nothing reads this column except
+  `core.serde.state_from_json`.
+- **`pw.io.postgres.write` is not actually license-gated** in the installed
+  `pathway==0.32.1` (confirmed by reading its source: the `_check_entitlements`
+  call lives only in `read()`'s CDC/replication path). The `auto`/`licensed`/
+  `psycopg` picker in `pipelines/pathway/sinks/postgres_sink.py` still exists and
+  is still tested both ways — it's what proves the Rust snapshot-writer and the
+  psycopg fallback agree exactly, and it guards against a future Pathway version
+  re-adding write-side gating.
 - **`.env.example` defaults to host-side values** (`POSTGRES_HOST`/`REDIS_HOST`/
   `OTEL_EXPORTER_OTLP_ENDPOINT` at `localhost`, `C3_DUCKDB_PATH`/`C3_DUCKDB_TEMP_DIR`
   under `data/`), because every `conquer3` command today runs on the host
