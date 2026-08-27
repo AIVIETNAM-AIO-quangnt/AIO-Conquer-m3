@@ -1,8 +1,0 @@
-This directory is bind-mounted into the postgres container's
-/docker-entrypoint-initdb.d, so it must exist for `docker compose up postgres` to
-start even before Layer 2 adds real schema files.
-
-Postgres only runs *.sql/*.sh files found here, in filename order, and only on a
-completely fresh data volume. Layer 2 adds 00_schemas.sql, 10_bronze.sql,
-20_silver.sql, 30_gold.sql, 40_ops.sql, and 90_indexes.sql (applied last,
-deliberately, since indexing after bulk load is far faster than indexing before).

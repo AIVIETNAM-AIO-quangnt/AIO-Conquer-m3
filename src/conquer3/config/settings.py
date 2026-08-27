@@ -12,7 +12,9 @@ convention, since those are frequently read by the tool's own code too.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from functools import lru_cache
+from typing import Any, Final
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -131,6 +133,37 @@ class KaggleSettings(BaseSettings):
     username: str | None = None
     key: str | None = None
     dataset: str = "ealaxi/paysim1"
+    # conquer3's own knob, not Kaggle's -- alias overrides the class's KAGGLE_ prefix
+    # the same way PathwaySettings.license_key does for PATHWAY_LICENSE_KEY above.
+    # The one place `conquer3 ingest download/bronze` and scripts/smoke/layer2_
+    # warehouse.sh all agree on where the raw PaySim1 CSV lives.
+    csv_path: str = Field(default="data/raw/paysim1.csv", alias="C3_PAYSIM_CSV_PATH")
+
+
+# Every nested settings class above is its own independent BaseSettings, so
+# constructing one via `default_factory` (the plain pydantic way) never sees
+# Settings.model_config's env_file="." + "env" -- pydantic-settings does not cascade
+# a parent's env_file into a nested BaseSettings field. Left alone, every nested
+# class is blind to .env and only ever reads real process env vars, silently
+# falling back to its class defaults (which are container paths/hosts for several
+# of them) whenever .env alone was supposed to supply the override. Settings.__init__
+# below closes that gap by constructing each nested class with the *same* env_file
+# Settings itself resolved to -- so `Settings()` makes every nested class read .env
+# too, and `Settings(_env_file=None)` (as tests/unit/test_settings.py uses for
+# isolation) correctly keeps every nested class blind to .env as well.
+_NESTED_SETTINGS_CLASSES: Final[Mapping[str, type[BaseSettings]]] = {
+    "pg": PgSettings,
+    "redis": RedisSettings,
+    "state": StateSettings,
+    "mlflow": MlflowSettings,
+    "model": ModelSettings,
+    "pathway": PathwaySettings,
+    "event": EventSettings,
+    "duck": DuckSettings,
+    "serving": ServingSettings,
+    "otel": OtelSettings,
+    "kaggle": KaggleSettings,
+}
 
 
 class Settings(BaseSettings):
@@ -151,6 +184,17 @@ class Settings(BaseSettings):
     serving: ServingSettings = Field(default_factory=ServingSettings)
     otel: OtelSettings = Field(default_factory=OtelSettings)
     kaggle: KaggleSettings = Field(default_factory=KaggleSettings)
+
+    def __init__(self, **kwargs: Any) -> None:
+        # Match pydantic-settings' own rule: an *explicitly passed* _env_file
+        # (including None) wins; otherwise fall back to this class's configured
+        # env_file -- never a bare `default_factory()` call.
+        env_file = (
+            kwargs["_env_file"] if "_env_file" in kwargs else self.model_config.get("env_file")
+        )
+        for field_name, cls in _NESTED_SETTINGS_CLASSES.items():
+            kwargs.setdefault(field_name, cls(_env_file=env_file))
+        super().__init__(**kwargs)
 
 
 @lru_cache(maxsize=1)

@@ -76,10 +76,25 @@ def test_module_pulls_no_heavy_dependency(module: str) -> None:
 
 
 def test_package_init_defines_only_metadata() -> None:
-    """A re-export in __init__.py would defeat every test above."""
-    import conquer3
+    """A re-export in __init__.py would defeat every test above.
 
-    public = {n for n in vars(conquer3) if not n.startswith("_")}
-    assert public <= {"core", "contracts", "cli", "config"}, (
+    Runs in a subprocess like the tests above -- checking ``vars(conquer3)``
+    in-process would pick up whatever *other* test modules happened to import
+    ``conquer3.db``/``conquer3.pipelines``/etc. earlier in the same pytest session
+    (ordinary Python submodule binding, nothing to do with ``__init__.py`` itself),
+    which is exactly the cross-test pollution this file's docstring warns about.
+    """
+    script = (
+        "import conquer3, json\n"
+        "print(json.dumps(sorted(n for n in vars(conquer3) if not n.startswith('_'))))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, f"importing conquer3 failed:\n{result.stderr}"
+    import json
+
+    public = set(json.loads(result.stdout.strip().splitlines()[-1]))
+    assert public == set(), (
         f"conquer3/__init__.py exposes {sorted(public)}; it must import nothing."
     )

@@ -67,7 +67,8 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      # Layer 2 adds the real schema/table DDL here; empty for now (see .gitkeep).
+      # Layer 2's medallion DDL. Only runs on a fresh volume -- an already-initialized
+      # volume needs `conquer3 db migrate` instead (see db/bootstrap.py).
       - ./src/conquer3/db/ddl:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conquer3} -d ${POSTGRES_DB:-conquer3}"]

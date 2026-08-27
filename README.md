@@ -18,7 +18,7 @@ pass before the next one starts.
 |---|---|---|
 | 0 — Skeleton | `conquer3.core` feature engine, import boundaries, tooling | ✅ Done — `scripts/smoke/layer0_skeleton.sh` |
 | 1 — Infra | Docker Compose: Postgres, Redis, OTel Collector, Airflow | ✅ Running — `scripts/smoke/layer1_infra.sh` |
-| 2 — Warehouse | Postgres medallion schema (bronze/silver/gold), DuckDB+Ibis transforms | ⬜ Not started |
+| 2 — Warehouse | Postgres medallion schema (bronze/silver/gold), DuckDB+Ibis transforms | ✅ Done — `scripts/smoke/layer2_warehouse.sh` |
 | 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done |
 | 3b — Pathway | Batch backfill + streaming state repair | ⬜ Not started |
 | 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ⬜ Not started |
@@ -29,8 +29,12 @@ pass before the next one starts.
 
 **What works right now:** `conquer3.core` (the feature engine — 34 features, cold-start
 handling, the associativity-verified state merge that keeps streaming and batch in
-sync), and the full local infra stack (`core` + `pipeline` Compose profiles) including
-a working Airflow install that successfully parses and runs a smoke-test DAG.
+sync), the full local infra stack (`core` + `pipeline` Compose profiles) including
+a working Airflow install that successfully parses and runs a smoke-test DAG, and the
+Layer 2 warehouse -- `conquer3 ingest bronze` / `conquer3 transform bronze-to-silver` /
+`conquer3 transform silver-to-gold` load a PaySim1 CSV through the full medallion
+pipeline into `gold.txn_features`, computing every feature via `conquer3.core.features`
+(never in SQL) so it's provably the same code path serving and Colab use.
 
 ## Prerequisites
 
@@ -101,6 +105,13 @@ docker compose config --quiet && echo "config OK"
 # Layer 0 gate: lint, type-check, import boundaries, full test suite, and a
 # bare-venv install proving conquer3.core has zero dependencies (the Colab path).
 ./scripts/smoke/layer0_skeleton.sh
+
+# Layer 2 gate: applies the medallion DDL, then runs ingest -> bronze -> silver ->
+# gold over the real PaySim1 dataset end to end. Needs Layer 1's `core` profile up.
+# Fetches the CSV itself if C3_PAYSIM_CSV_PATH (.env) isn't already there --
+# extracts a sibling .zip if one's present, else downloads it (PaySim1 is public,
+# no Kaggle credentials needed).
+./scripts/smoke/layer2_warehouse.sh
 ```
 
 Ad hoc:
@@ -123,8 +134,8 @@ src/conquer3/
 │                  # model_registry.py (MLflow contract -- Layer 4, not built yet)
 ├── config/         # settings.py -- the ONLY place env vars are read
 ├── telemetry/      # otel.py -- no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
-├── db/             # Postgres + DuckDB/Ibis engine -- Layer 2, not built yet
-├── pipelines/       # medallion transforms + Pathway graph -- Layers 2/3b, not built yet
+├── db/             # Postgres + DuckDB/Ibis engine, and db/ddl/*.sql -- Layer 2
+├── pipelines/       # ingest/ + transforms/ (Layer 2, done); pathway/ (Layer 3b, not built yet)
 ├── serving/        # BentoML service -- Layer 5, not built yet
 ├── producer/       # transaction replay driver -- Layer 5, not built yet
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
@@ -182,3 +193,23 @@ installs only what it needs — see `docker/*.Dockerfile`.
   real one into `.env` on first run.
 - Pathway (`stream` profile) and BentoML (`serving` profile) containers build and
   install cleanly today but have no entry point yet — Layers 3b and 5.
+- **`.env.example` defaults to host-side values** (`POSTGRES_HOST`/`REDIS_HOST`/
+  `OTEL_EXPORTER_OTLP_ENDPOINT` at `localhost`, `C3_DUCKDB_PATH`/`C3_DUCKDB_TEMP_DIR`
+  under `data/`), because every `conquer3` command today runs on the host
+  (`uv run conquer3 ...`), reaching Postgres/Redis/the collector via
+  docker-compose's host port mappings -- `conquer3` isn't importable inside the
+  airflow-* containers yet (see above). Once Layer 6 runs `conquer3` inside a
+  container on the `c3net` network, *that* container's env needs the compose
+  service names instead (`postgres`, `redis`, `http://otel-collector:4317`) and a
+  `/duckdb`-mounted path -- don't just copy `.env`'s current values in for it.
+- **`Settings`'s nested classes (`PgSettings`, `DuckSettings`, ...) each explicitly
+  get `.env` threaded down to them** by `Settings.__init__` in `config/settings.py`
+  -- a plain `Field(default_factory=PgSettings)` would silently construct them with
+  *no* `env_file` at all (pydantic-settings doesn't cascade a parent's `env_file`
+  into a nested `BaseSettings` field), so they'd only ever see real process env
+  vars and quietly fall back to class defaults whenever `.env` alone was supposed
+  to supply the override. See that method's docstring for the full mechanism.
+  Separately, `scripts/smoke/layer2_warehouse.sh` still does
+  `set -a; source .env; set +a` before running anything -- that's for the script's
+  *own* bash-level use of those values (`docker compose exec`'s `$POSTGRES_USER`,
+  `$C3_PAYSIM_CSV_PATH` for locating the raw CSV), unrelated to the Python fix above.
