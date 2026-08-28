@@ -92,16 +92,27 @@ def _transform(duck: Any, *, flush_every: int) -> int:
     reader = duck.sql(_READ_SQL).to_pyarrow_batches(chunk_size=_READ_CHUNK_ROWS)
     rows = _flatten(reader)
 
-    buffer: list[dict[str, Any]] = []
-    total = 0
-    for group in _account_groups(rows):
-        buffer.extend(_compute_gold_rows(group))
-        if len(buffer) >= flush_every:
-            total += _flush(duck, buffer)
-            buffer = []
-    if buffer:
-        total += _flush(duck, buffer)
-    return total
+    # A dedicated cursor for the write-side flushes below. `duck.con` supports only
+    # one active result at a time, and `reader` above is a still-open streaming
+    # result on that same connection -- running the flush INSERT through `duck.con`
+    # directly silently truncates the read with no error (confirmed empirically: a
+    # second statement on the same connection invalidates the first result instead
+    # of raising). A cursor shares the same in-process DuckDB database without
+    # competing for the connection's single result slot.
+    write_cursor = duck.con.cursor()
+    try:
+        buffer: list[dict[str, Any]] = []
+        total = 0
+        for group in _account_groups(rows):
+            buffer.extend(_compute_gold_rows(group))
+            if len(buffer) >= flush_every:
+                total += _flush(write_cursor, buffer)
+                buffer = []
+        if buffer:
+            total += _flush(write_cursor, buffer)
+        return total
+    finally:
+        write_cursor.close()
 
 
 def _flatten(reader: pa.RecordBatchReader) -> Iterator[dict[str, Any]]:
@@ -158,12 +169,11 @@ def _compute_gold_rows(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _flush(duck: Any, rows: list[dict[str, Any]]) -> int:
+def _flush(cursor: Any, rows: list[dict[str, Any]]) -> int:
     table = pa.Table.from_pylist(rows, schema=_GOLD_SCHEMA)
-    raw = duck.con
-    raw.register("_stage_gold", table)
+    cursor.register("_stage_gold", table)
     try:
-        raw.execute("INSERT INTO pg.gold.txn_features SELECT * FROM _stage_gold")
+        cursor.execute("INSERT INTO pg.gold.txn_features SELECT * FROM _stage_gold")
     finally:
-        raw.unregister("_stage_gold")
+        cursor.unregister("_stage_gold")
     return len(rows)

@@ -158,7 +158,10 @@ packages = ["conquer3"]
 mypy_path = "src"
 
 [[tool.mypy.overrides]]
-module = ["kagglehub.*", "bentoml.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*"]
+module = [
+  "kagglehub.*", "bentoml.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*",
+  "pandas.*", "sklearn.*",
+]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -168,6 +171,7 @@ markers = [
   "slow: builds an isolated venv or touches large data",
   "integration: needs docker-compose services running",
   "pathway: spawns a real pw.run() in its own subprocess; slow, one-shot per process",
+  "mlflow: spawns a real local mlflow server subprocess; no Docker needed",
 ]
 
 [tool.coverage.run]

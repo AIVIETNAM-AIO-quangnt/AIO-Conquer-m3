@@ -117,6 +117,57 @@ def _cmd_pathway_streaming(_: argparse.Namespace) -> int:
     return run_streaming_main()
 
 
+def _cmd_model_publish_dummy(args: argparse.Namespace) -> int:
+    import subprocess
+
+    import numpy as np
+    import pandas as pd
+    import sklearn
+    from sklearn.dummy import DummyClassifier
+
+    from conquer3.contracts.model_registry import publish_model
+    from conquer3.core.schema import CATEGORICAL_FEATURES, FEATURE_NAMES, NUMERIC_FEATURES
+
+    rng = np.random.default_rng(0)
+    n = 20
+    data: dict[str, object] = {name: rng.normal(size=n) for name in NUMERIC_FEATURES}
+    for name in CATEGORICAL_FEATURES:
+        data[name] = rng.choice(["a", "b"], size=n)
+    x_sample = pd.DataFrame(data, columns=list(FEATURE_NAMES))
+    y = rng.integers(0, 2, size=n)
+
+    clf = DummyClassifier(strategy="prior").fit(x_sample, y)
+    proba = clf.predict_proba(x_sample)
+
+    try:
+        code_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except Exception:
+        code_sha = "unknown"
+
+    ref = publish_model(
+        clf,
+        x_sample,
+        proba,
+        sklearn_version=sklearn.__version__,
+        code_sha=code_sha,
+        decision_threshold=0.5,
+        model_name=args.name,
+        alias_as_champion=args.alias_champion,
+    )
+    print(f"published\t{ref.name}\tversion={ref.version}\trun_id={ref.run_id}")
+    return 0
+
+
+def _cmd_model_resolve_champion(args: argparse.Namespace) -> int:
+    from conquer3.contracts.model_registry import resolve_champion
+
+    _model, ref = resolve_champion(args.name)
+    print(f"resolved\t{ref.name}\tversion={ref.version}\tdegraded={ref.degraded}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="conquer3", description="Credit-fraud MLOps platform")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -175,6 +226,24 @@ def build_parser() -> argparse.ArgumentParser:
     pathway_sub.add_parser(
         "streaming", help="streaming-mode: continuously repair account state"
     ).set_defaults(handler=_cmd_pathway_streaming)
+
+    model = sub.add_parser("model", help="MLflow model registry contract (Layer 4)")
+    model_sub = model.add_subparsers(dest="model_command", required=True)
+    publish_dummy = model_sub.add_parser(
+        "publish-dummy", help="publish a DummyClassifier -- smoke-tests the registry contract"
+    )
+    publish_dummy.add_argument("--name", default=None, help="model name (default: C3_MODEL_NAME)")
+    publish_dummy.add_argument(
+        "--alias-champion", action="store_true", help='also alias the new version "champion"'
+    )
+    publish_dummy.set_defaults(handler=_cmd_model_publish_dummy)
+    resolve_champion = model_sub.add_parser(
+        "resolve-champion", help='resolve the "champion" alias (live, falling back to cache)'
+    )
+    resolve_champion.add_argument(
+        "--name", default=None, help="model name (default: C3_MODEL_NAME)"
+    )
+    resolve_champion.set_defaults(handler=_cmd_model_resolve_champion)
 
     return parser
 

@@ -21,7 +21,7 @@ pass before the next one starts.
 | 2 — Warehouse | Postgres medallion schema (bronze/silver/gold), DuckDB+Ibis transforms | ✅ Done — `scripts/smoke/layer2_warehouse.sh` |
 | 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done — `scripts/smoke/layer3_feature_core.sh` |
 | 3b — Pathway | Batch backfill + streaming state repair | ✅ Done — `scripts/smoke/layer3b_pathway.sh` |
-| 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ⬜ Not started |
+| 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ✅ Done — `scripts/smoke/layer4_model_registry.sh` |
 | 5 — Serving | BentoML service, Redis state store, event sink | ⬜ Not started |
 | 6 — Airflow DAGs | Bootstrap/ingest/medallion/DQ/skew-audit/champion-watch DAGs | ⬜ Not started (only the `hello_world` smoke DAG exists) |
 | 7 — Observability | Local OTel Collector wired; remote Grafana endpoints | 🟡 Collector running locally; remote endpoints not yet supplied |
@@ -40,7 +40,12 @@ backfill` / `conquer3 pathway streaming`) folds the same `TransactionEvent` stre
 into per-account state via a custom reducer that delegates to `core.features.
 advance_state`/`merge_states`, mirroring it to Redis (through a shared monotonic-CAS
 Lua script) and to `gold.account_state`, via either the licensed `pw.io.postgres.write`
-connector or a CAS-guarded psycopg fallback -- both proven to agree exactly.
+connector or a CAS-guarded psycopg fallback -- both proven to agree exactly. The
+model contract (`conquer3 model publish-dummy` / `conquer3 model resolve-champion`)
+publishes a signed, tagged model version to MLflow and resolves the "champion"
+alias back to a concrete version, with a champion cache (JSON ref + downloaded
+artifact) that lets resolution degrade gracefully -- and quickly -- to the last
+known-good model if the tracking server is unreachable at boot.
 
 ## Prerequisites
 
@@ -130,6 +135,27 @@ docker compose config --quiet && echo "config OK"
 # deduplication -- all via pytest + ephemeral testcontainers Postgres/Redis, so it
 # never touches (or needs) the real docker-compose stack.
 ./scripts/smoke/layer3b_pathway.sh
+
+# Layer 4 gate: publish registers a version with tags + a logged signature,
+# pyfunc.load_model downloads and predicts, re-aliasing makes the resolver follow,
+# a dead MLFLOW_TRACKING_URI falls back to the cached champion and flips the
+# c3_model_resolution_degraded gauge, and conda.yaml names mlflow, never
+# mlflow-skinny -- all via pytest against an ephemeral local `mlflow server`
+# (sqlite backend, no Docker needed at all). Verified end to end (including
+# against a real remote MLflow deployment, not just the ephemeral local one).
+./scripts/smoke/layer4_model_registry.sh
+```
+
+To check a *real* `MLFLOW_TRACKING_URI` (not the gate's ephemeral local server) once
+`.env` points at one:
+
+```bash
+uv run conquer3 model publish-dummy --alias-champion   # register + alias a throwaway model
+uv run conquer3 model resolve-champion                 # resolve it back, confirm degraded=False
+uv run pytest -s tests/unit/test_model_registry.py::test_log_current_champion_from_registry
+#   ^ prints the live registry's current champion (name/version/run_id/tags) --
+#     diagnostic only, no assertions, and never downloads the artifact (see
+#     "Known gaps" below for why that matters).
 ```
 
 Ad hoc:
@@ -149,7 +175,7 @@ src/conquer3/
 │                  # what ships into Google Colab via `pip install conquer3[train]`.
 │                  # timeref.py, schema.py, types.py, features.py, serde.py.
 ├── contracts/      # events.py (JSONL scored-event layout, stdlib-only),
-│                  # model_registry.py (MLflow contract -- Layer 4, not built yet)
+│                  # model_registry.py (MLflow contract -- Layer 4, done)
 ├── config/         # settings.py -- the ONLY place env vars are read
 ├── telemetry/      # otel.py -- no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 ├── db/             # Postgres + DuckDB/Ibis engine, and db/ddl/*.sql -- Layer 2
@@ -230,9 +256,29 @@ installs only what it needs — see `docker/*.Dockerfile`.
   is still tested both ways — it's what proves the Rust snapshot-writer and the
   psycopg fallback agree exactly, and it guards against a future Pathway version
   re-adding write-side gating.
+- **`MLFLOW_TRACKING_URI` is still an empty placeholder in `.env.example`.** Layer 4's
+  own gate never needs one (an ephemeral local `mlflow server` per test run), but
+  `conquer3 model publish-dummy`/`resolve-champion` against a real deployment need
+  a real remote address supplied once available -- an "Open item" carried from the
+  architecture plan, not something this layer could resolve itself.
+- **Some MLflow deployments don't correctly support the HTTP Range requests
+  `resolve_champion`'s artifact download relies on.** Confirmed against a real
+  remote server whose reverse proxy silently ignores `Range` headers (returns `200`
+  with the full body instead of `206` with the requested slice) -- MLflow's chunked
+  downloader reads that as a failed chunk and retries forever. The registry API
+  call and the artifact chunk-download have *separate* MLflow-side timeout knobs
+  (`MLFLOW_HTTP_REQUEST_TIMEOUT` vs. `MLFLOW_DOWNLOAD_CHUNK_TIMEOUT`, the latter
+  defaulting to 300s); `resolve_champion` now bounds both via
+  `ModelSettings.resolve_timeout_s`, so a broken/slow artifact store degrades to
+  the cached champion in seconds instead of blocking boot for minutes. A
+  connection that trickles bytes just fast enough to keep each individual socket
+  read from ever timing out can still outlast any client-side bound, though --
+  that class of failure needs a server-side fix (check Range-header handling in
+  whatever sits in front of the tracking server).
 - **`.env.example` defaults to host-side values** (`POSTGRES_HOST`/`REDIS_HOST`/
-  `OTEL_EXPORTER_OTLP_ENDPOINT` at `localhost`, `C3_DUCKDB_PATH`/`C3_DUCKDB_TEMP_DIR`
-  under `data/`), because every `conquer3` command today runs on the host
+  `OTEL_EXPORTER_OTLP_ENDPOINT` at `localhost`, `C3_DUCKDB_PATH`/`C3_DUCKDB_TEMP_DIR`/
+  `C3_MODEL_CACHE_DIR`/`C3_MODEL_CHAMPION_CACHE_FILE` under `data/`), because every
+  `conquer3` command today runs on the host
   (`uv run conquer3 ...`), reaching Postgres/Redis/the collector via
   docker-compose's host port mappings -- `conquer3` isn't importable inside the
   airflow-* containers yet (see above). Once Layer 6 runs `conquer3` inside a

@@ -76,6 +76,13 @@ class ModelSettings(BaseSettings):
     alias: str = "champion"
     cache_dir: str = "/models"
     champion_cache_file: str = "/models/champion.json"
+    # Bounds MLFLOW_HTTP_REQUEST_TIMEOUT/MLFLOW_HTTP_REQUEST_MAX_RETRIES (mlflow's
+    # own env-driven knobs, set by contracts.model_registry.resolve_champion right
+    # before the network call) -- confirmed empirically that mlflow's default
+    # (120s timeout, 7 retries with exponential backoff) can block a dead tracking
+    # server for minutes even though each individual attempt is refused instantly.
+    resolve_timeout_s: int = 10
+    resolve_max_retries: int = 2
 
 
 class PathwaySettings(BaseSettings):

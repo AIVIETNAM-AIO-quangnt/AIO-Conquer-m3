@@ -12,7 +12,9 @@ from dataclasses import dataclass
 
 import psycopg
 
-__all__ = ["RunHandle", "track_run"]
+from conquer3.contracts.model_registry import ModelRef
+
+__all__ = ["RunHandle", "record_model_deployment", "track_run"]
 
 
 @dataclass
@@ -45,6 +47,19 @@ def track_run(conn: psycopg.Connection, layer: str) -> Iterator[RunHandle]:
         raise
     else:
         _finish(conn, run_id, status="success", handle=handle, detail=handle.detail)
+
+
+def record_model_deployment(conn: psycopg.Connection, ref: ModelRef) -> None:
+    """Audit-trail row for a resolved model version. Not called by anything in
+    Layer 4 -- Layer 5's serving boot sequence calls resolve_champion() then this,
+    in that order, since contracts.model_registry can never import conquer3.db
+    (layering forbids it)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ops.model_deployments (model_name, version, run_id, alias, degraded) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (ref.name, ref.version, ref.run_id, ref.alias, ref.degraded),
+        )
 
 
 def _finish(

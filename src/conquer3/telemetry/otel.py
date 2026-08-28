@@ -10,8 +10,12 @@ keeps the remote observability endpoints pure configuration.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from conquer3.config.settings import get_settings
+
+if TYPE_CHECKING:
+    from opentelemetry.metrics import Meter
 
 _initialized = False
 
@@ -44,3 +48,12 @@ def init_telemetry(service_name: str) -> None:
         BatchSpanProcessor(OTLPSpanExporter(endpoint=settings.exporter_otlp_endpoint))
     )
     trace.set_tracer_provider(provider)
+
+
+def get_meter(name: str) -> Meter:
+    """Returns an OTel Meter -- a safe no-op until a real MeterProvider is wired
+    into init_telemetry (Layer 7's job: the collector/Grafana metrics pipeline).
+    Callers never need to check settings.otel themselves, same as the tracer."""
+    from opentelemetry import metrics
+
+    return metrics.get_meter(name)

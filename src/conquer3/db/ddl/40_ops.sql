@@ -11,3 +11,17 @@ CREATE TABLE IF NOT EXISTS ops.pipeline_runs (
     rows_out      BIGINT,
     detail        TEXT
 );
+
+-- Audit trail of resolved model versions -- written by db.ops.record_model_deployment,
+-- called by whichever process resolves a champion (BentoML boot, Layer 5). Aliases
+-- are mutable; this table names the immutable version actually loaded, and whether
+-- resolution fell back to the degraded (cached) path.
+CREATE TABLE IF NOT EXISTS ops.model_deployments (
+    deployment_id BIGSERIAL PRIMARY KEY,
+    model_name    TEXT NOT NULL,
+    version       TEXT NOT NULL,
+    run_id        TEXT NOT NULL,
+    alias         TEXT NOT NULL,
+    degraded      BOOLEAN NOT NULL DEFAULT false,
+    resolved_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
