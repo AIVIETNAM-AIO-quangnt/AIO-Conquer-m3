@@ -10,6 +10,10 @@ from __future__ import annotations
 import argparse
 import sys
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from conquer3.contracts.model_registry import ModelRef
 
 
 def _cmd_version(_: argparse.Namespace) -> int:
@@ -168,6 +172,35 @@ def _cmd_model_resolve_champion(args: argparse.Namespace) -> int:
     return 0
 
 
+def _record_deployment(ref: ModelRef) -> None:
+    # Lives here, not in conquer3.serving, because import-linter forbids
+    # conquer3.serving from ever importing conquer3.db (see db/ops.py's
+    # record_model_deployment docstring). A failed audit-trail write must never
+    # take the scorer down -- Postgres being unavailable is not the property the
+    # Layer 5 gate defends; a dead remote MLflow is.
+    import logging
+
+    from conquer3.db.engine import pg_connection
+    from conquer3.db.ops import record_model_deployment
+
+    try:
+        with pg_connection() as conn:
+            record_model_deployment(conn, ref)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "failed to record model deployment for version %s", ref.version, exc_info=True
+        )
+
+
+def _cmd_serve(_: argparse.Namespace) -> int:
+    from conquer3.config.settings import get_settings
+    from conquer3.serving.supervisor import serve
+    from conquer3.telemetry.otel import init_telemetry
+
+    init_telemetry("conquer3-scorer")
+    return serve(get_settings(), on_deployment=_record_deployment)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="conquer3", description="Credit-fraud MLOps platform")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -244,6 +277,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--name", default=None, help="model name (default: C3_MODEL_NAME)"
     )
     resolve_champion.set_defaults(handler=_cmd_model_resolve_champion)
+
+    sub.add_parser(
+        "serve", help="run the scoring service: resolve champion, serve /invocations (Layer 5)"
+    ).set_defaults(handler=_cmd_serve)
 
     return parser
 

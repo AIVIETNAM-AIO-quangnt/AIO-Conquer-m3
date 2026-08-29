@@ -20,7 +20,9 @@ otel = [
 registry = [
   # Full mlflow, NOT mlflow-skinny: logging a model from a skinny env writes
   # `mlflow-skinny` into the model's conda.yaml and breaks container-based serving.
-  "mlflow>=2.16,<4",
+  # >=3.5 is load-bearing: 2.x's model-serving CLI serves via Flask+gunicorn, 3.5+
+  # via FastAPI+uvicorn -- Layer 5 depends on the latter (see `serving` below).
+  "mlflow>=3.5,<4",
 ]
 train = [
   "conquer3[registry]",
@@ -35,7 +37,15 @@ train = [
 ]
 serving = [
   "conquer3[registry,otel]",
-  "bentoml>=1.4",
+  # mlflow does NOT depend on these unconditionally -- confirmed by reading
+  # mlflow.pyfunc.scoring_server.app's source: it imports fastapi/uvicorn lazily,
+  # inside scoring_server.init(), and only mlflow's own `gateway`/`genai` extras
+  # (which also pull in boto3, tiktoken, etc. -- unrelated to serving a local
+  # sklearn model) declare them as real dependencies. We are the inference
+  # endpoint (not a gateway to anything), so we depend on exactly what
+  # `mlflow.pyfunc.scoring_server` needs, directly and minimally.
+  "fastapi>=0.110",
+  "uvicorn>=0.30",
   "redis>=5.0",
   "scikit-learn>=1.5,<1.8",
   "pandas>=2.2",
@@ -93,7 +103,7 @@ type = "forbidden"
 source_modules = ["conquer3.core"]
 forbidden_modules = [
   "numpy", "pandas", "polars", "pyarrow", "pydantic", "pydantic_settings",
-  "redis", "duckdb", "ibis", "pathway", "bentoml", "mlflow", "sklearn",
+  "redis", "duckdb", "ibis", "pathway", "mlflow", "sklearn",
   "joblib", "psycopg", "opentelemetry",
   "conquer3.config", "conquer3.db", "conquer3.serving",
   "conquer3.pipelines", "conquer3.contracts", "conquer3.telemetry",
@@ -122,7 +132,7 @@ forbidden_modules = [
 name = "pipelines never import serving"
 type = "forbidden"
 source_modules = ["conquer3.pipelines"]
-forbidden_modules = ["conquer3.serving", "bentoml"]
+forbidden_modules = ["conquer3.serving"]
 
 [[tool.importlinter.contracts]]
 name = "layered architecture"
@@ -159,7 +169,7 @@ mypy_path = "src"
 
 [[tool.mypy.overrides]]
 module = [
-  "kagglehub.*", "bentoml.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*",
+  "kagglehub.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*",
   "pandas.*", "sklearn.*",
 ]
 ignore_missing_imports = true

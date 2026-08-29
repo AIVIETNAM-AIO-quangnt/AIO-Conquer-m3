@@ -100,24 +100,6 @@ services:
     networks: [c3net]
     restart: unless-stopped
 
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.127.0
-    profiles: [core]
-    command: ["--config=/etc/otelcol-contrib/config.yaml"]
-    volumes:
-      - ./docker/otel/${C3_OTEL_COLLECTOR_CONFIG:-collector.local.yaml}:/etc/otelcol-contrib/config.yaml:ro
-    env_file:
-      - .env
-    ports:
-      - "4317:4317" # OTLP gRPC
-      - "4318:4318" # OTLP HTTP
-      - "13133:13133" # health_check extension
-    networks: [c3net]
-    restart: unless-stopped
-    # No container HEALTHCHECK: the contrib image is a distroless-style build with
-    # no shell/curl to exec one against. scripts/smoke/layer1_infra.sh instead polls
-    # :13133 from the host, which is exactly what the Layer 1 gate specifies.
-
   # ────────────────────────────── pipeline ──────────────────────────────
   # Airflow's OWN metadata store -- separate from the `postgres` warehouse above by
   # design, so Airflow's internal state can never collide with medallion data.
@@ -253,6 +235,15 @@ services:
     profiles: [stream]
     env_file:
       - .env
+    # .env's own values are host-friendly (POSTGRES_HOST=localhost,
+    # REDIS_HOST=localhost) -- see README's "Known gaps": every `conquer3`
+    # command today runs on the host, reaching postgres/redis via compose's
+    # host port mappings. Inside this container, `localhost` is the container
+    # itself -- these re-point at the compose service names instead (same fix
+    # `scorer`'s service block applies, and for the same reason).
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_HOST: redis
     volumes:
       - events:/events:ro
       - staging:/staging:ro
@@ -271,15 +262,38 @@ services:
     # Layer 6) writes it.
 
   # ─────────────────────────────── serving ───────────────────────────────
-  bentoml:
+  # This container IS the inference endpoint -- it pulls the champion artifact
+  # out of remote MLflow once at boot and serves /invocations entirely from
+  # local files, local Redis, and local CPU from then on. It is not a gateway
+  # or proxy in front of remote MLflow; see README's Layer 5 section.
+  scorer:
     build:
       context: .
       dockerfile: docker/serving.Dockerfile
     profiles: [serving]
     env_file:
       - .env
+    # .env's own values are host-friendly (REDIS_HOST=localhost,
+    # C3_MODEL_CACHE_DIR=data/models, ...) -- see README's "Known gaps": every
+    # `conquer3` command today runs on the host, reaching redis via compose's
+    # host port mapping. Inside this container, `localhost` is the container
+    # itself and `data/models` doesn't exist -- these overrides re-point both
+    # at the compose service name and the mounted volumes below.
+    environment:
+      REDIS_HOST: redis
+      C3_MODEL_CACHE_DIR: /models
+      C3_MODEL_CHAMPION_CACHE_FILE: /models/champion.json
+      C3_WRAPPED_MODEL_DIR: /models/wrapped
+      C3_CURRENT_MODEL_SYMLINK: /models/current
+    # Lets MLFLOW_TRACKING_URI=http://host.docker.internal:<port> reach an
+    # MLflow server running on the host (e.g. a throwaway `mlflow server` for a
+    # local demo) -- confirmed this does NOT resolve by default on Linux Docker
+    # Engine (only Docker Desktop), so it's declared explicitly rather than
+    # assumed. A real remote MLflow address needs no such thing.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
-      - "${BENTOML_PORT:-3000}:3000"
+      - "${C3_SCORER_PORT:-3000}:3000"
     volumes:
       - events:/events
       - modelcache:/models
@@ -288,13 +302,16 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:3000/readyz"]
+      # /ping is one of the scoring server's four fixed routes (no /readyz --
+      # that was a BentoML artifact; mlflow's scoring server cannot be extended
+      # with custom routes).
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/ping"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
     restart: unless-stopped
-    # Service code lands in Layer 5 (serving/service.py, bentofile.yaml).
+    # conquer3 serve (src/conquer3/serving/supervisor.py) -- Layer 5.
 
   # ──────────────────────────────── demo ────────────────────────────────
   producer:
@@ -308,6 +325,7 @@ services:
       - ${AIRFLOW_PROJ_DIR:-.}/data:/data:ro
     networks: [c3net]
     depends_on:
-      bentoml:
+      scorer:
         condition: service_healthy
-    # Entry point lands in Layer 5 (producer/replay.py).
+    # Entry point is producer/replay.py -- a thin client shim around
+    # /invocations, not built yet.

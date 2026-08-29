@@ -28,6 +28,7 @@ __all__ = [
     "IncompatibleModelError",
     "ModelRef",
     "ModelRegistryError",
+    "cached_model_dir",
     "publish_model",
     "resolve_champion",
     "verify_compatible",
@@ -169,7 +170,7 @@ def resolve_champion(
         verify_compatible(cached.tags)
         import mlflow.pyfunc
 
-        local_dir = _cached_model_dir(settings.model, cached.name, cached.version)
+        local_dir = cached_model_dir(settings.model, cached.name, cached.version)
         model = mlflow.pyfunc.load_model(str(local_dir))
         degraded_ref = ModelRef(**{**asdict(cached), "degraded": True})
         _emit_degraded_gauge(True)
@@ -211,7 +212,7 @@ def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[Mode
     verify_compatible(mv.tags)  # before downloading the artifact, not after
 
     assert mv.run_id is not None
-    local_dir = _cached_model_dir(settings.model, model_name, mv.version)
+    local_dir = cached_model_dir(settings.model, model_name, mv.version)
     local_dir.mkdir(parents=True, exist_ok=True)
     model = mlflow.pyfunc.load_model(f"models:/{model_name}@{alias}", dst_path=str(local_dir))
     ref = ModelRef(
@@ -220,7 +221,14 @@ def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[Mode
     return ref, model
 
 
-def _cached_model_dir(model_settings: ModelSettings, model_name: str, version: str) -> Path:
+def cached_model_dir(model_settings: ModelSettings, model_name: str, version: str) -> Path:
+    """Where the raw sklearn artifact for one resolved version lives on disk.
+
+    Public because Layer 5's wrapper build (``serving/build.py``) needs the exact
+    same path to hand to ``mlflow.sklearn.load_model`` -- it must never re-derive
+    this independently and risk drifting from what ``resolve_champion`` actually
+    downloaded into.
+    """
     return Path(model_settings.cache_dir) / model_name / version
 
 

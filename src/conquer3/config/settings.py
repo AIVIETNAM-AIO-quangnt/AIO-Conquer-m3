@@ -118,7 +118,24 @@ class ServingSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="C3_", extra="ignore")
 
     decision_threshold: float = 0.5
-    admin_token: str = "change-me"
+    scorer_host: str = "0.0.0.0"
+    scorer_port: int = 3000
+    scorer_workers: int = 2
+    # Per-request timeout mlflow's scoring server enforces, not a startup timeout.
+    scorer_timeout_s: int = 60
+    # How often the supervisor re-runs resolve_champion() after boot -- the only
+    # recurring contact with remote MLflow. A version change triggers a local
+    # wrapper rebuild + SIGHUP reload; it does not touch resolve_champion's own
+    # bounded per-call timeouts (C3_MODEL_RESOLVE_TIMEOUT_S), so a slow/dead
+    # tracking server delays only the *next* promotion, never `/invocations`.
+    champion_poll_s: int = 300
+    # Local pyfunc wrapper builds, one directory per resolved version -- separate
+    # from C3_MODEL_CACHE_DIR (the raw sklearn artifact Layer 4 downloads), which
+    # this wraps rather than replaces.
+    wrapped_model_dir: str = "/models/wrapped"
+    # The live serving path, atomically re-pointed at a new wrapped_model_dir
+    # entry on every champion change (os.replace(), never a partial state).
+    current_model_symlink: str = "/models/current"
 
 
 class OtelSettings(BaseSettings):

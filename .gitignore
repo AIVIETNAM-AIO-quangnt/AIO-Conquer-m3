@@ -20,7 +20,12 @@ data/*
 # dags/ and plugins/ are source and stay tracked, logs/ is not
 airflow/logs/
 
-# AI agent
+# local infrastructure (debugging only)
+docker/mlflow*
+compose.*.yaml
+
+# AI agent & IDE
+.vscode
 CLAUDE.md
 AGENTS.md
 skills-lock.json

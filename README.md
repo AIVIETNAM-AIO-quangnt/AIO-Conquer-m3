@@ -22,7 +22,7 @@ pass before the next one starts.
 | 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done — `scripts/smoke/layer3_feature_core.sh` |
 | 3b — Pathway | Batch backfill + streaming state repair | ✅ Done — `scripts/smoke/layer3b_pathway.sh` |
 | 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ✅ Done — `scripts/smoke/layer4_model_registry.sh` |
-| 5 — Serving | BentoML service, Redis state store, event sink | ⬜ Not started |
+| 5 — Serving | `scorer` (MLflow's own scoring server as a library), Redis state store, event sink | ✅ Done — `scripts/smoke/layer5_serving.sh` |
 | 6 — Airflow DAGs | Bootstrap/ingest/medallion/DQ/skew-audit/champion-watch DAGs | ⬜ Not started (only the `hello_world` smoke DAG exists) |
 | 7 — Observability | Local OTel Collector wired; remote Grafana endpoints | 🟡 Collector running locally; remote endpoints not yet supplied |
 | 8 — Colab notebook | Training template | ⬜ Not started |
@@ -45,7 +45,17 @@ model contract (`conquer3 model publish-dummy` / `conquer3 model resolve-champio
 publishes a signed, tagged model version to MLflow and resolves the "champion"
 alias back to a concrete version, with a champion cache (JSON ref + downloaded
 artifact) that lets resolution degrade gracefully -- and quickly -- to the last
-known-good model if the tracking server is unreachable at boot.
+known-good model if the tracking server is unreachable at boot. `conquer3 serve`
+(the `scorer` service, Layer 5) **is the inference endpoint** -- it resolves the
+champion once at boot, builds a local `mlflow.pyfunc` wrapper around it that owns
+feature computation (via `conquer3.core.features`, the same code Colab and batch
+use), the Redis read-modify-write, and the JSONL event sink, then serves
+`POST /invocations` entirely from local files, local Redis, and local CPU.
+Remote MLflow is storage and a logbook only -- never an inference backend -- and
+`scorer` is not a gateway or proxy in front of it: killing remote MLflow
+entirely leaves `/invocations` serving at full correctness, and only *new*
+champion promotions stop arriving (picked back up automatically once MLflow
+returns, via a background poll every `C3_CHAMPION_POLL_S`).
 
 ## Prerequisites
 
@@ -61,15 +71,21 @@ git clone <this repo> && cd conquer3
 # 1. Python env + .env (generates a real Fernet key and JWT secret into .env)
 ./scripts/bootstrap.sh
 
-# 2. Core infra: Postgres, Redis, OTel Collector
-docker compose --profile core up -d
+# 2. The whole docker-compose stack, profile by profile, waiting for each
+#    service to actually report healthy before moving on
+./scripts/startup.sh
 
-# 3. Airflow (separate profile — its own metadata DB, 5 services)
-docker compose --profile pipeline up -d --build
-
-# 4. Verify everything end-to-end (see "Verifying" below)
+# 3. Verify everything end-to-end (see "Verifying" below)
 ./scripts/smoke/layer1_infra.sh
 ```
+
+`scripts/startup.sh` brings up `core` → `pipeline` → `stream` in order (each is
+safe to start with nothing else configured); `serving` only if `.env` already
+has a real `MLFLOW_TRACKING_URI` — bringing `scorer` up without one would just
+crash-loop, since it resolves a champion at boot and refuses to guess. Bring it
+up later with `docker compose --profile serving up -d --build` once you have
+one (see "Running the scorer" below). Re-running `startup.sh` is safe --
+already-healthy services are left alone.
 
 Airflow UI: **http://localhost:8080** — login from `_AIRFLOW_WWW_USER_USERNAME` /
 `_AIRFLOW_WWW_USER_PASSWORD` in `.env` (defaults to `airflow` / `change-me`).
@@ -92,8 +108,8 @@ Nothing starts unless you pick a profile — there's no default "just run
 | `core` | `postgres`, `redis`, `otel-collector` | Needed by everything else |
 | `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, separate from the `postgres` warehouse) |
 | `stream` | `pathway` | Feature engine (Layer 3b — static backfill + streaming state repair) |
-| `serving` | `bentoml` | Scoring API (Layer 5 — builds today, nothing to serve yet) |
-| `demo` | `producer` | Transaction replay driver (Layer 5) |
+| `serving` | `scorer` | Scoring API (Layer 5 — the inference endpoint; see "Running the scorer" below) |
+| `demo` | `producer` | Transaction replay driver (`producer/replay.py`, not built yet) |
 | `tools` | `adminer` | Postgres UI at http://localhost:8081 |
 
 Combine profiles freely: `docker compose --profile core --profile pipeline up -d`.
@@ -144,6 +160,19 @@ docker compose config --quiet && echo "config OK"
 # (sqlite backend, no Docker needed at all). Verified end to end (including
 # against a real remote MLflow deployment, not just the ephemeral local one).
 ./scripts/smoke/layer4_model_registry.sh
+
+# Layer 5 gate: scorer IS the inference endpoint, proven against a real
+# ephemeral local mlflow server + a real ephemeral Redis (testcontainers) + the
+# actual mlflow.pyfunc.scoring_server subprocess -- back-to-back and batched
+# same-account calls carry state, dry_run leaves Redis/events untouched,
+# op=model_info reports the resolved version, concurrent same-account requests
+# never corrupt state, a champion promotion reloads within one poll interval
+# with zero non-2xx responses, a boot against dead MLflow falls back to the
+# cached champion (degraded=true on every response), and -- the property the
+# whole architecture is built around -- killing remote MLflow entirely after
+# boot leaves /invocations serving at full correctness. Needs Docker only for
+# the ephemeral Redis container.
+./scripts/smoke/layer5_serving.sh
 ```
 
 To check a *real* `MLFLOW_TRACKING_URI` (not the gate's ephemeral local server) once
@@ -157,6 +186,165 @@ uv run pytest -s tests/unit/test_model_registry.py::test_log_current_champion_fr
 #     diagnostic only, no assertions, and never downloads the artifact (see
 #     "Known gaps" below for why that matters).
 ```
+
+## Running the scorer
+
+`scorer` needs a champion to resolve at boot, so publish one first (a throwaway
+`DummyClassifier` is fine for a smoke run -- swap in a real Colab-trained model
+once Layer 8 exists). `C3_SCORER_WORKERS` must stay `>= 2`: with exactly one
+worker, uvicorn installs no `SIGHUP` handler at all, so a champion promotion
+would kill the process instead of reloading it (`conquer3 serve` refuses to
+start below 2, so a misconfigured `.env` fails loudly at boot, not silently on
+the first promotion).
+
+**Without Docker** (needs `core` profile's Redis up; a real `MLFLOW_TRACKING_URI`
+in `.env`, or `mlflow server` in a second terminal for a fully local demo --
+`export` it rather than editing `.env`, since a real env var wins over `.env`'s
+value without permanently changing it):
+
+```bash
+docker compose --profile core up -d redis                # or: redis-server, if you have it locally
+uv run mlflow server --host 127.0.0.1 --port 5000 &       # a throwaway local registry, for a demo
+export MLFLOW_TRACKING_URI=http://127.0.0.1:5000          # overrides .env for this shell only
+
+uv run conquer3 model publish-dummy --alias-champion       # register + alias a throwaway champion
+uv run conquer3 serve                                      # resolves it, boots on :3000
+```
+
+In another terminal:
+
+```bash
+curl http://localhost:3000/ping                            # one of MLflow's four fixed routes
+
+curl -X POST http://localhost:3000/invocations \
+  -H 'Content-Type: application/json' \
+  -d '{"dataframe_records": [{"event_id": "e1", "account_id": "C1", "dest_id": "M900",
+        "txn_type": "TRANSFER", "amount": 181.0, "oldbalance_org": 181.0,
+        "newbalance_orig": 0.0, "oldbalance_dest": 0.0, "newbalance_dest": 181.0,
+        "event_ts_us": 1700000000000000, "step": 1}]}'
+#   -> {"predictions": [{"event_id": "e1", "fraud_score": ..., "decision": "...",
+#        "had_prev_state": false, "seconds_since_last_txn": null,
+#        "model_version": "1", "feature_schema_version": 1, "degraded": false}]}
+
+# Send it again with a later event_ts_us for the same account_id: had_prev_state
+# flips to true and seconds_since_last_txn is no longer null -- state round-
+# tripped through Redis between the two calls.
+
+curl -X POST http://localhost:3000/invocations \
+  -H 'Content-Type: application/json' \
+  -d '{"dataframe_records": [{"event_id": "_", "account_id": "_", "dest_id": "_",
+        "txn_type": "TRANSFER", "amount": 0, "oldbalance_org": 0, "newbalance_orig": 0,
+        "oldbalance_dest": 0, "newbalance_dest": 0, "event_ts_us": 0, "step": 0}],
+      "params": {"op": "model_info"}}'
+#   -> the resolved ModelRef (name/version/run_id/alias/degraded) as one row.
+#      The row above is ignored by op=model_info but still required -- MLflow
+#      enforces the input schema before predict() ever runs, regardless of op.
+```
+
+Promote a new champion in another terminal (`conquer3 model publish-dummy
+--alias-champion` again) and `scorer` picks it up within `C3_CHAMPION_POLL_S`
+(default 300s locally; lower it in `.env` for a faster demo) -- `op=model_info`
+will report the new version, with zero downtime across the switch.
+
+### MLflow local service (Docker-based)
+
+`compose.parity.yaml` includes a standalone MLflow service (`mlflow` on `serving`
+profile) that auto-imports the champion from `.model_artifacts/paysim/champion`
+at startup. Serves registry + proxied artifacts on port 5000.
+
+**Networking & host header validation:** Both `mlflow` and `scorer` run on the
+`c3net` Docker network. Scorer reaches MLflow via service name:
+`MLFLOW_TRACKING_URI=http://mlflow:5000`. MLflow's FastAPI validates incoming
+`Host` headers against an allowlist to prevent DNS rebinding attacks; the
+included `docker/mlflow-standalone/entrypoint.sh` sets `--allowed-hosts "*"`
+for local dev (sufficient for service-name connectivity). Production
+deployments should restrict this to specific hostnames.
+
+**With Docker** (`serving` profile; needs `core` up first, and `MLFLOW_TRACKING_URI`
+in `.env` reachable *from inside the container* -- `localhost` won't resolve to
+your host from in there; `docker-compose.yaml` maps `host.docker.internal` to
+the host gateway for you (`extra_hosts`), so `http://host.docker.internal:<port>`
+reaches a server on the host on every platform, not just Docker Desktop; a real
+remote address needs no such thing):
+
+```bash
+docker compose --profile core --profile serving up -d --build
+docker compose ps scorer                                   # healthy once /ping responds
+curl http://localhost:${C3_SCORER_PORT:-3000}/ping
+```
+
+### Transaction input/output schema
+
+`POST /invocations` accepts `dataframe_records` with 11 required fields:
+
+```json
+{
+  "dataframe_records": [
+    {
+      "event_id": "string",
+      "account_id": "string", 
+      "dest_id": "string",
+      "txn_type": "string (TRANSFER|PAYMENT|CASH_OUT|DEBIT|CASH_IN)",
+      "amount": "float",
+      "oldbalance_org": "float",
+      "newbalance_orig": "float",
+      "oldbalance_dest": "float",
+      "newbalance_dest": "float",
+      "event_ts_us": "int (Unix timestamp in microseconds)",
+      "step": "int (simulation step)"
+    }
+  ],
+  "params": {
+    "op": "score|model_info",
+    "dry_run": true|false
+  }
+}
+```
+
+Response:
+
+```json
+{
+  "predictions": [
+    {
+      "event_id": "string",
+      "fraud_score": "float (0.0-1.0)",
+      "decision": "fraud|legitimate",
+      "had_prev_state": "bool",
+      "seconds_since_last_txn": "float | null",
+      "model_version": "string",
+      "feature_schema_version": "int",
+      "degraded": "bool"
+    }
+  ]
+}
+```
+
+**State tracking:** Scores for the same `account_id` called twice return updated
+state (e.g., `had_prev_state=true`, `seconds_since_last_txn` populated). State
+is persisted in Redis and survives scorer restarts via `C3_STATE_TTL_DAYS`
+(default 90 days). `dry_run=true` skips Redis updates and event writes.
+
+Two things confirmed empirically if you point this at a throwaway local
+`mlflow server` (as in the no-Docker demo above) instead of a real deployment:
+
+- **MLflow's own DNS-rebinding protection rejects `host.docker.internal` by
+  default.** `mlflow server` (`mlflow>=3.x`) validates the incoming `Host`
+  header against an allowlist that covers `localhost`/private IPs but not
+  hostnames like `host.docker.internal`; without an override it answers `403
+  Invalid Host header - possible DNS rebinding attack detected` to every
+  request from the container. Start the demo server with
+  `--allowed-hosts 'host.docker.internal:*'` (or `MLFLOW_SERVER_ALLOWED_HOSTS`)
+  to let it through. A real deployment reached by its real address doesn't hit
+  this at all.
+- **A `mlflow server` with a local-filesystem `--default-artifact-root` only
+  serves artifacts to clients that share that filesystem.** It's a fine
+  shortcut for the no-Docker demo above (host-side `conquer3` and the host-side
+  `mlflow server` share one disk), but the client-side artifact repo silently
+  resolves to a local path the *container* can't see, so `resolve_champion`
+  fails there. Point at a real deployment (with real remote artifact storage)
+  to exercise the Docker profile end to end -- this is specifically a
+  same-machine-only shortcut in the demo server, not a `scorer` limitation.
 
 Ad hoc:
 
@@ -179,13 +367,19 @@ src/conquer3/
 ├── config/         # settings.py -- the ONLY place env vars are read
 ├── telemetry/      # otel.py -- no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set
 ├── db/             # Postgres + DuckDB/Ibis engine, and db/ddl/*.sql -- Layer 2
-├── redis_scripts/  # monotonic_cas.lua -- shared by Pathway (Layer 3b) and
-│                  # BentoML (Layer 5, not built yet), so both write through the
-│                  # exact same CAS semantics by construction
+├── redis_scripts/  # monotonic_cas.lua -- shared by Pathway (Layer 3b) and the
+│                  # scorer (Layer 5), so both write through the exact same CAS
+│                  # semantics by construction
 ├── pipelines/       # ingest/ + transforms/ (Layer 2 + export_staging.py for
 │                  # Layer 3b, done); pathway/ (Layer 3b, done)
-├── serving/        # BentoML service -- Layer 5, not built yet
-├── producer/       # transaction replay driver -- Layer 5, not built yet
+├── serving/        # scorer -- Layer 5, done. pyfunc_model.py (FraudScorerModel:
+│                  # feature computation + Redis + event sink), signature.py
+│                  # (ModelSignature generated from TransactionEvent), build.py
+│                  # (resolve champion -> local wrapper -> symlink swap),
+│                  # supervisor.py (`conquer3 serve`: launches MLflow's own
+│                  # scoring server, polls for champion changes, SIGHUPs to
+│                  # reload), state_store.py, event_sink.py
+├── producer/       # transaction replay driver -- not built yet
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
 
 airflow/
@@ -198,7 +392,9 @@ docker/             # one Dockerfile per service family + docker/otel/*.yaml
                     # (docker/airflow.Dockerfile exists but isn't wired into
                     # docker-compose.yaml yet -- see "Known gaps" below)
 scripts/
-├── bootstrap.sh    # one-time setup
+├── bootstrap.sh    # one-time setup: uv sync, generate .env
+├── startup.sh      # bring the whole docker-compose stack up, profile by
+│                  # profile, waiting for each service to report healthy
 └── smoke/          # one gate script per layer
 
 tests/{unit,parity,integration,contract}/
@@ -213,10 +409,17 @@ extra:
 | Extra | Pulls in | Used by |
 |---|---|---|
 | `train` | scikit-learn, pandas, kagglehub, mlflow | Colab notebook (Layer 8) |
-| `serving` | bentoml, redis, mlflow, scikit-learn | `serving/` (Layer 5) |
+| `serving` | mlflow, fastapi, uvicorn, redis, scikit-learn | `serving/` (Layer 5, done) |
 | `pipeline` | ibis, duckdb, polars, psycopg | `db/`, `pipelines/` (Layer 2) |
 | `stream` | pathway, redis, psycopg | `pipelines/pathway/` (Layer 3b, done) |
 | `registry` | mlflow (full, not `-skinny`) | `contracts/model_registry.py` |
+
+`fastapi`/`uvicorn` are listed explicitly, not inherited from `mlflow` itself:
+confirmed by reading `mlflow.pyfunc.scoring_server`'s source that it imports
+them lazily, inside `scoring_server.init()`, and the base `mlflow` package does
+not declare them as dependencies at all -- only mlflow's own `gateway`/`genai`
+extras do (and those pull in unrelated things like `boto3`/`tiktoken`). `scorer`
+depends on exactly what its own scoring server needs, directly.
 
 `uv sync --all-extras` installs everything for local development. Each Docker image
 installs only what it needs — see `docker/*.Dockerfile`.
@@ -239,8 +442,24 @@ installs only what it needs — see `docker/*.Dockerfile`.
 - **`AIRFLOW__CORE__FERNET_KEY` must be empty or a real 32-byte urlsafe-base64
   Fernet key** — never a placeholder string. `scripts/bootstrap.sh` generates a
   real one into `.env` on first run.
-- BentoML (`serving` profile) container builds and installs cleanly today but has
-  no entry point yet — Layer 5. Pathway (`stream` profile) is wired up (Layer 3b).
+- **`C3_SCORER_WORKERS` must be `>= 2`** — `conquer3 serve` refuses to start
+  below that. Confirmed by reading `uvicorn.main` (`uvicorn==0.52.4`): the
+  `SIGHUP`-handling `Multiprocess` supervisor is only installed when
+  `workers > 1`; with exactly one worker, `SIGHUP` falls through to the OS
+  default (terminate) instead of triggering a reload. `C3_SCORER_WORKERS=1`
+  does not "skip reloads" — it kills the whole scorer on the first champion
+  promotion.
+- **`restart_all()`'s reload is best-effort and gives the supervisor no
+  callback.** Confirmed empirically (an aborted restart under host load, mid
+  test suite: `ERROR: New child process was not ready in time; keeping worker
+  and aborting the restart`, uvicorn's own safe fallback) — `serving/supervisor.py`
+  does not trust "SIGHUP sent" as "reload succeeded"; it probes the running
+  server for the version it actually reports and only advances its own
+  tracked state (and only records the deployment) once that's confirmed, so
+  an aborted restart is retried on the *next* poll tick instead of silently
+  stalling forever on the old version.
+- Pathway (`stream` profile) is wired up (Layer 3b). `scorer` (`serving`
+  profile) is wired up and has a real entry point (Layer 5, `conquer3 serve`).
 - **`gold.account_state.state_json` is `TEXT`, not `JSONB`**, even though it holds
   serialized JSON. Confirmed empirically: the licensed `pw.io.postgres.write`
   connector's Rust driver refuses to write a Pathway `str` column into a `JSONB`
@@ -261,6 +480,18 @@ installs only what it needs — see `docker/*.Dockerfile`.
   `conquer3 model publish-dummy`/`resolve-champion` against a real deployment need
   a real remote address supplied once available -- an "Open item" carried from the
   architecture plan, not something this layer could resolve itself.
+- **MLflow's host header validation blocks container-to-container requests by default.**
+  `mlflow server` (`mlflow>=3.x`) validates incoming `Host` headers against an
+  allowlist covering `localhost` and private IPs but rejecting arbitrary hostnames
+  and container service names. **For DevOps:** Start the MLflow server with
+  `--allowed-hosts '*'` (permissive, local dev only), `--allowed-hosts 'mlflow,mlflow:5000'`
+  (allow service-name connectivity), or your production hostname
+  `--allowed-hosts 'mlflow.company.com'`. Environment variable alternative:
+  `MLFLOW_SERVER_ALLOWED_HOSTS='mlflow.company.com'`. A client connecting from inside
+  a Docker container via the service name (e.g., `http://mlflow:5000`) will be rejected
+  with `403 Invalid Host header - possible DNS rebinding attack detected` unless explicitly
+  allowed. This is **not** a conquer3 issue — it's MLflow's own security feature that
+  requires configuration when the server is reached via non-standard hostnames.
 - **Some MLflow deployments don't correctly support the HTTP Range requests
   `resolve_champion`'s artifact download relies on.** Confirmed against a real
   remote server whose reverse proxy silently ignores `Range` headers (returns `200`
