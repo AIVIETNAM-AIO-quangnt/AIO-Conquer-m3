@@ -194,16 +194,32 @@ def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[Mode
     # 120s timeout + 7 retries with exponential backoff can take minutes even
     # though each individual connection attempt is refused instantly).
     #
-    # MLFLOW_DOWNLOAD_CHUNK_TIMEOUT bounds a *different* failure mode from the two
-    # above: a tracking server that answers registry API calls fine but whose
-    # artifact storage is broken (confirmed empirically against a real deployment
-    # whose reverse proxy silently ignores HTTP Range requests -- returns 200 with
-    # the full body instead of 206 with the requested range -- which the chunked
-    # artifact downloader reads as a failed chunk and retries forever). Without
-    # this, that failure mode blocks boot for minutes (mlflow's default is 300s
-    # *per chunk attempt*) despite the registry-call timeout above being tight.
+    # The two below address a *different* failure mode from the registry call: a
+    # tracking server that answers registry API calls fine but cannot actually
+    # deliver artifact bytes.
+    #
+    # MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false forces artifacts to stream
+    # through the tracking server, instead of the presigned-URL path mlflow 3.x
+    # auto-enables whenever the server advertises it in /server-info. That path
+    # hands the client a signed object-store URL and pulls chunks straight from
+    # it, bypassing the tracking server entirely -- silently adding a second
+    # network dependency the deployment contract never promised. Confirmed
+    # empirically: a remote registry returned presigned URLs on host
+    # `storage:9000` (its own compose-internal MinIO), so every chunk failed DNS
+    # resolution while the server's access log showed nothing but 200s for the
+    # presigned-URL requests themselves. The tracking URI is the only endpoint a
+    # client is guaranteed to reach, and these artifacts are a few MB, so
+    # proxying them costs nothing worth that failure mode.
+    #
+    # MLFLOW_DOWNLOAD_CHUNK_TIMEOUT covers the remaining chunked path, but note
+    # what it does *not* cover: mlflow reads it only in CloudArtifactRepository
+    # (a direct `s3://`-style artifact root), never in the proxied
+    # `mlflow-artifacts:` repository this deployment uses, whose chunk timeout is
+    # hardcoded to 10s. It is set for the `s3://` case only -- it is not, and
+    # never was, a bound on the presigned path disabled above.
     os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = str(settings.model.resolve_timeout_s)
     os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = str(settings.model.resolve_max_retries)
+    os.environ["MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD"] = "false"
     os.environ["MLFLOW_DOWNLOAD_CHUNK_TIMEOUT"] = str(settings.model.resolve_timeout_s)
     mlflow.set_tracking_uri(settings.mlflow.tracking_uri)
 
