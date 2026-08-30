@@ -639,6 +639,7 @@ otel = [
 pipeline = [
     { name = "duckdb" },
     { name = "ibis-framework", extra = ["duckdb", "postgres"] },
+    { name = "kagglehub" },
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-sdk" },
     { name = "polars" },
@@ -708,6 +709,7 @@ requires-dist = [
     { name = "ibis-framework", extras = ["duckdb", "postgres"], marker = "extra == 'pipeline'", specifier = ">=9.5" },
     { name = "joblib", marker = "extra == 'serving'", specifier = ">=1.4" },
     { name = "joblib", marker = "extra == 'train'", specifier = ">=1.4" },
+    { name = "kagglehub", marker = "extra == 'pipeline'", specifier = ">=1.0.2" },
     { name = "kagglehub", marker = "extra == 'train'", specifier = ">=0.3" },
     { name = "matplotlib", marker = "extra == 'train'", specifier = ">=3.9" },
     { name = "mlflow", marker = "extra == 'registry'", specifier = ">=3.5,<4" },
