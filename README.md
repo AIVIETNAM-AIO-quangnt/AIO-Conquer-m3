@@ -17,14 +17,14 @@ pass before the next one starts.
 | Layer | What | Status |
 |---|---|---|
 | 0 — Skeleton | `conquer3.core` feature engine, import boundaries, tooling | ✅ Done — `scripts/smoke/layer0_skeleton.sh` |
-| 1 — Infra | Docker Compose: Postgres, Redis, OTel Collector, Airflow | ✅ Running — `scripts/smoke/layer1_infra.sh` |
+| 1 — Infra | Docker Compose: Postgres, Redis, Airflow | ✅ Running — `scripts/smoke/layer1_infra.sh` |
 | 2 — Warehouse | Postgres medallion schema (bronze/silver/gold), DuckDB+Ibis transforms | ✅ Done — `scripts/smoke/layer2_warehouse.sh` |
 | 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done — `scripts/smoke/layer3_feature_core.sh` |
 | 3b — Pathway | Batch backfill + streaming state repair | ✅ Done — `scripts/smoke/layer3b_pathway.sh` |
 | 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ✅ Done — `scripts/smoke/layer4_model_registry.sh` |
 | 5 — Serving | `scorer` (MLflow's own scoring server as a library), Redis state store, event sink | ✅ Done — `scripts/smoke/layer5_serving.sh` |
 | 6 — Airflow DAGs | Bootstrap/ingest/medallion/DQ/skew-audit/champion-watch DAGs | ⬜ Not started (only the `hello_world` smoke DAG exists) |
-| 7 — Observability | Local OTel Collector wired; remote Grafana endpoints | 🟡 Collector running locally; remote endpoints not yet supplied |
+| 7 — Observability | `telemetry/otel.py` (traces+metrics+logs), redis-get→predict→redis-set→file-append spans, `c3_*` metrics — pushed straight to a remote LGTM stack's own collector, no local collector container | 🟡 Traces and logs confirmed landing in Tempo/Loki end to end; metrics have nowhere to land until the remote Prometheus enables its remote-write receiver (or gets a scrape target) — see `.env`'s observability section — `scripts/smoke/layer7_observability.sh` |
 | 8 — Colab notebook | Training template | ⬜ Not started |
 
 ## Prerequisites
@@ -75,7 +75,7 @@ Nothing starts unless you pick a profile — there's no default "just run
 
 | Profile | Services | Purpose |
 |---|---|---|
-| `core` | `postgres`, `redis`, `otel-collector` | Needed by everything else |
+| `core` | `postgres`, `redis` | Needed by everything else |
 | `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, separate from the `postgres` warehouse) |
 | `stream` | `pathway` | Feature engine (Layer 3b — static backfill + streaming state repair) |
 | `serving` | `scorer` | Scoring API (Layer 5 — the inference endpoint; see "Running the scorer" below) |
@@ -85,8 +85,11 @@ Nothing starts unless you pick a profile — there's no default "just run
 Combine profiles freely: `docker compose --profile core --profile pipeline up -d`.
 
 MLflow and Grafana/Prometheus/Loki/Tempo are **remote** — never in this file. Point
-at them via `MLFLOW_TRACKING_URI` and the `C3_PROM_*` / `C3_LOKI_*` /
-`C3_OTLP_TEMPO_ENDPOINT` vars in `.env` once you have addresses.
+at them via `MLFLOW_TRACKING_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` in `.env` once
+you have addresses — app code talks OTLP straight to the remote stack's own
+collector (no local collector container), which does the fan-out into its
+co-located Prometheus/Tempo/Loki. Verify reachability yourself with
+`scripts/smoke/layer7_observability.sh`.
 
 ## Verifying
 
@@ -321,8 +324,7 @@ Ad hoc:
 ```bash
 docker compose ps                        # health status
 docker compose logs -f airflow-init       # watch db migrate + admin user creation
-docker compose logs -f otel-collector
-curl http://localhost:13133               # collector health_check extension
+bash scripts/smoke/layer7_observability.sh  # verify the remote LGTM stack itself
 ```
 
 ## Repo layout

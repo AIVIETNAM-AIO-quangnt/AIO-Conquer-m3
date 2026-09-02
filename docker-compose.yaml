@@ -123,29 +123,6 @@ services:
     networks: [c3net]
     restart: unless-stopped
 
-  # Layer 7: local OTel Collector -- receives OTLP from every process
-  # (conquer3.telemetry.otel), fans out to `debug` (this container's own log) plus
-  # whatever collector.local.yaml/collector.remote.yaml route to. Selected via
-  # C3_OTEL_COLLECTOR_CONFIG; defaults to the credential-free local config so the
-  # stack runs end-to-end with nothing supplied. No healthcheck: the image is a
-  # minimal distroless build with no shell/curl/wget to run one, and nothing in
-  # this compose file depends on it being healthy on purpose -- telemetry must
-  # never gate or block scoring (same "never take scoring down" principle as a
-  # dead remote MLflow; see README's Layer 5 section).
-  otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.159.0
-    profiles: [core]
-    env_file:
-      - .env
-    volumes:
-      - ./docker/otel/${C3_OTEL_COLLECTOR_CONFIG:-collector.local.yaml}:/etc/otelcol-contrib/config.yaml:ro
-    ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "13133:13133"
-    networks: [c3net]
-    restart: unless-stopped
-
   # ────────────────────────────── pipeline ──────────────────────────────
   # Airflow's OWN metadata store -- separate from the `postgres` warehouse above by
   # design, so Airflow's internal state can never collide with medallion data.
@@ -302,7 +279,9 @@ services:
     environment:
       POSTGRES_HOST: postgres
       REDIS_HOST: redis
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      # OTEL_EXPORTER_OTLP_ENDPOINT is not overridden here -- .env's value is a
+      # real remote address, reachable the same way from inside this container
+      # as from the host, unlike POSTGRES_HOST/REDIS_HOST above (always ours).
     volumes:
       - events:/events:ro
       - staging:/staging:ro
@@ -344,7 +323,8 @@ services:
       C3_MODEL_CHAMPION_CACHE_FILE: /models/champion.json
       C3_WRAPPED_MODEL_DIR: /models/wrapped
       C3_CURRENT_MODEL_SYMLINK: /models/current
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      # OTEL_EXPORTER_OTLP_ENDPOINT: not overridden -- see the same note on the
+      # `pathway` service above.
     # Lets MLFLOW_TRACKING_URI=http://host.docker.internal:<port> reach an
     # MLflow server running on the host (e.g. a throwaway `mlflow server` for a
     # local demo) -- confirmed this does NOT resolve by default on Linux Docker

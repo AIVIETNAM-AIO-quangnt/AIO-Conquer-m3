@@ -14,7 +14,9 @@ def main() -> int:
     from conquer3.pipelines.pathway.sinks.postgres_sink import write_account_state
     from conquer3.pipelines.pathway.sinks.redis_sink import RedisStateObserver
     from conquer3.pipelines.pathway.sources import read_staging_events
+    from conquer3.telemetry.otel import init_telemetry
 
+    init_telemetry("conquer3-pathway-backfill")
     settings = get_settings()
     pw.set_license_key(settings.pathway.license_key or None)
 

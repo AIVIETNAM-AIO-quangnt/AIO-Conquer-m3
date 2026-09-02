@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Layer 1 gate: core infra (postgres, redis, otel-collector) and the Airflow
-# pipeline profile come up healthy, and a hello-world DAG runs end to end.
-# Do not start Layer 2 (the medallion warehouse) until this passes.
+# Layer 1 gate: core infra (postgres, redis) and the Airflow pipeline profile
+# come up healthy, and a hello-world DAG runs end to end. Do not start Layer 2
+# (the medallion warehouse) until this passes.
+#
+# Observability (Layer 7) has no local otel-collector container -- app processes
+# push OTLP straight to whatever OTEL_EXPORTER_OTLP_ENDPOINT in .env points at
+# (a remote LGTM stack's own collector). See scripts/smoke/layer7_observability.sh.
 #
 # Requires Docker and Docker Compose v2. Not runnable in a sandbox without a Docker
 # daemon -- run this on a machine that has one.
@@ -46,21 +50,6 @@ docker compose exec -T postgres psql -U "${POSTGRES_USER:-conquer3}" -d "${POSTG
 
 echo "  redis: PING"
 docker compose exec -T redis redis-cli ping | grep -q PONG
-
-echo "  otel-collector: :13133 health_check extension"
-# No in-container healthcheck is possible (see docker-compose.yaml) -- poll the
-# host-mapped port instead, which is what the Layer 1 gate actually specifies.
-waited=0
-until curl -fsS "http://localhost:13133" >/dev/null 2>&1; do
-  waited=$((waited + 2))
-  if [ "$waited" -ge 60 ]; then
-    echo "FAIL: otel-collector :13133 did not return 200 within 60s" >&2
-    docker compose logs --tail=50 otel-collector >&2 || true
-    exit 1
-  fi
-  sleep 2
-done
-echo "  otel-collector: OK"
 
 echo
 echo "== profile: pipeline =="

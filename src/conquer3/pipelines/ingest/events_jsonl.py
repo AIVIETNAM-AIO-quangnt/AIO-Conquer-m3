@@ -11,12 +11,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from conquer3.db.engine import pg_connection
+import psycopg
 
 __all__ = ["ingest_events_jsonl"]
 
 
-def ingest_events_jsonl(conn) -> int:  # type: ignore
+def ingest_events_jsonl(conn: psycopg.Connection) -> int:
     """Consume JSONL from scored event files and insert into bronze.scored_events.
 
     Offset-based: reads ops.file_ingest_log to find the last consumed position

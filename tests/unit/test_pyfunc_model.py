@@ -71,6 +71,10 @@ def _make_model(
     sink = _FakeEventSink()
     model._state = state  # type: ignore[attr-defined]
     model._sink = sink  # type: ignore[attr-defined]
+    # Bypasses load_context (see module docstring), so the tracer/instruments it
+    # would normally create there have to be set up here instead -- get_tracer/
+    # get_meter are safe no-ops without a real init_telemetry() call.
+    model._init_instruments()  # type: ignore[attr-defined]
     return model, state, sink
 
 

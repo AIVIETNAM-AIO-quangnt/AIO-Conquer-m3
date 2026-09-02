@@ -46,23 +46,24 @@ def verify_feature_count() -> str:
     """
     from conquer3.db.engine import pg_connection
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM gold.txn_features")
-            features_count = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM gold.account_state")
-            account_count = cur.fetchone()[0]
+    with pg_connection() as conn, conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM gold.txn_features")
+        features_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM gold.account_state")
+        account_count = cur.fetchone()[0]
 
-            # Each account should have exactly one state row
-            cur.execute("SELECT count(DISTINCT account_id) FROM gold.txn_features")
-            distinct_accounts = cur.fetchone()[0]
+        # Each account should have exactly one state row
+        cur.execute("SELECT count(DISTINCT account_id) FROM gold.txn_features")
+        distinct_accounts = cur.fetchone()[0]
 
-            if account_count != distinct_accounts:
-                raise AssertionError(
-                    f"account_state count {account_count} != distinct accounts {distinct_accounts}"
-                )
+        if account_count != distinct_accounts:
+            raise AssertionError(
+                f"account_state count {account_count} != distinct accounts {distinct_accounts}"
+            )
 
-    print(f"Feature count {features_count} verified against state {account_count} distinct accounts")
+    print(
+        f"Feature count {features_count} verified against state {account_count} distinct accounts"
+    )
     return f"verified: {distinct_accounts} accounts"
 
 

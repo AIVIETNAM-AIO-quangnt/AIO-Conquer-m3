@@ -38,6 +38,7 @@ from conquer3.core.types import FeatureVector, TransactionEvent
 from conquer3.serving.event_sink import JsonlEventSink
 from conquer3.serving.signature import TXN_FIELD_NAMES
 from conquer3.serving.state_store import RedisStateStore
+from conquer3.telemetry.otel import get_meter, get_tracer, init_telemetry
 
 __all__ = ["FraudScorerModel"]
 
@@ -53,6 +54,10 @@ class FraudScorerModel(PythonModel):
     _KNOWN_OPS: ClassVar[frozenset[str]] = frozenset({"score", "model_info"})
 
     def load_context(self, context: PythonModelContext) -> None:
+        # uvicorn workers are separate OS processes from the supervisor that
+        # already called init_telemetry() in cli.py's _cmd_serve -- this is the
+        # one that actually needs to run in the process serving /invocations.
+        init_telemetry("conquer3-scorer")
         self._pipe = mlflow.sklearn.load_model(context.artifacts["champion"])
         self._ref = ModelRef(
             **json.loads(Path(context.artifacts["ref"]).read_text(encoding="utf-8"))
@@ -61,6 +66,31 @@ class FraudScorerModel(PythonModel):
         self._threshold = settings.serving.decision_threshold
         self._state = RedisStateStore(redis_settings=settings.redis, state_settings=settings.state)
         self._sink = JsonlEventSink(event_settings=settings.event)
+        self._init_instruments()
+
+    def _init_instruments(self) -> None:
+        """Tracer + the scorer's share of plan §10's "Custom instruments" list.
+
+        Split out from load_context so tests can call it directly without a real
+        MLflow artifact/Redis/event dir (see tests/unit/test_pyfunc_model.py) --
+        get_tracer/get_meter are safe no-ops whether or not init_telemetry has run.
+        """
+        self._tracer = get_tracer(__name__)
+        meter = get_meter(__name__)
+        self._score_latency_histogram = meter.create_histogram(
+            "c3_score_latency_ms",
+            unit="ms",
+            description="Wall-clock time to compute features and score one transaction",
+        )
+        self._fraud_score_histogram = meter.create_histogram(
+            "c3_fraud_score", description="Predicted fraud probability, per scored transaction"
+        )
+        self._decision_counter = meter.create_counter(
+            "c3_decision_total", description="Scored transactions by decision"
+        )
+        self._feature_null_counter = meter.create_counter(
+            "c3_feature_null_total", description="Null feature values, by feature name"
+        )
 
     def predict(
         self,
@@ -93,37 +123,64 @@ class FraudScorerModel(PythonModel):
             by_account.setdefault(txn.account_id, []).append(i)
 
         responses: list[dict[str, Any] | None] = [None] * len(txns)
-        for account_id, idxs in by_account.items():
-            idxs.sort(key=lambda i: (txns[i].event_ts_us, txns[i].event_id))
-            # Reading current state is not a side effect a dry_run needs to avoid --
-            # only the write side (commit + event append) is skipped below, so a
-            # dry_run reproduces the score a live request would actually get.
-            prev = self._state.get(account_id)
-            for i in idxs:
-                txn = txns[i]
-                features, new_state = compute(txn, prev)
-                proba = self._predict_proba(features)
-                new_state = dataclasses.replace(new_state, last_fraud_score=proba)
-                decision = "FRAUD" if proba >= self._threshold else "LEGIT"
-                had_prev_state = prev is not None
+        with self._tracer.start_as_current_span(
+            "score_batch", attributes={"dry_run": dry_run, "row_count": len(txns)}
+        ):
+            for account_id, idxs in by_account.items():
+                idxs.sort(key=lambda i: (txns[i].event_ts_us, txns[i].event_id))
+                # Reading current state is not a side effect a dry_run needs to
+                # avoid -- only the write side (commit + event append) is skipped
+                # below, so a dry_run reproduces the score a live request would
+                # actually get.
+                with self._tracer.start_as_current_span(
+                    "redis_get", attributes={"account_id": account_id}
+                ):
+                    prev = self._state.get(account_id)
+                for i in idxs:
+                    txn = txns[i]
+                    with self._tracer.start_as_current_span(
+                        "predict",
+                        attributes={"account_id": account_id, "event_id": txn.event_id},
+                    ):
+                        start = time.perf_counter()
+                        features, new_state = compute(txn, prev)
+                        proba = self._predict_proba(features)
+                        self._score_latency_histogram.record((time.perf_counter() - start) * 1000)
 
-                if not dry_run:
-                    self._state.commit(new_state)
-                    self._sink.append(
-                        self._to_scored_event(txn, features, proba, decision, had_prev_state)
-                    )
+                    new_state = dataclasses.replace(new_state, last_fraud_score=proba)
+                    decision = "FRAUD" if proba >= self._threshold else "LEGIT"
+                    had_prev_state = prev is not None
+                    self._fraud_score_histogram.record(proba)
+                    self._decision_counter.add(1, {"decision": decision})
+                    for feature_name, value in features.values.items():
+                        if value is None:
+                            self._feature_null_counter.add(1, {"feature": feature_name})
 
-                responses[i] = {
-                    "event_id": txn.event_id,
-                    "fraud_score": proba,
-                    "decision": decision,
-                    "had_prev_state": had_prev_state,
-                    "seconds_since_last_txn": features.values["seconds_since_last_txn"],
-                    "model_version": self._ref.version,
-                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
-                    "degraded": self._ref.degraded,
-                }
-                prev = new_state
+                    if not dry_run:
+                        with self._tracer.start_as_current_span(
+                            "redis_set", attributes={"account_id": account_id}
+                        ):
+                            self._state.commit(new_state)
+                        with self._tracer.start_as_current_span(
+                            "file_append", attributes={"account_id": account_id}
+                        ):
+                            self._sink.append(
+                                self._to_scored_event(
+                                    txn, features, proba, decision, had_prev_state
+                                )
+                            )
+
+                    responses[i] = {
+                        "event_id": txn.event_id,
+                        "fraud_score": proba,
+                        "decision": decision,
+                        "had_prev_state": had_prev_state,
+                        "seconds_since_last_txn": features.values["seconds_since_last_txn"],
+                        "model_version": self._ref.version,
+                        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                        "degraded": self._ref.degraded,
+                    }
+                    prev = new_state
 
         assert all(r is not None for r in responses)
         return pd.DataFrame(responses)

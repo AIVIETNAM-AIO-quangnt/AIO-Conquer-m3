@@ -6,6 +6,10 @@
 # OTEL_EXPORTER_OTLP_ENDPOINT (see conquer3.telemetry.otel). Swapping to
 # collector.remote.yaml is a config change, not a code change.
 
+# otlp is the ONLY receiver -- push-only, on purpose. MLflow's scoring server
+# (plan §8.7) exposes no /metrics route to scrape, so every process (scorer,
+# Pathway, Airflow tasks) pushes OTLP instead. This also sidesteps Prometheus
+# multiprocess mode, which any multi-worker scrape endpoint would have forced.
 receivers:
   otlp:
     protocols:
@@ -13,17 +17,6 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-  prometheus:
-    config:
-      scrape_configs:
-        - job_name: conquer3-bentoml
-          scrape_interval: 15s
-          static_configs:
-            - targets: ["bentoml:3000"]
-        - job_name: otel-collector-self
-          scrape_interval: 30s
-          static_configs:
-            - targets: ["localhost:8888"]
 
 processors:
   memory_limiter:
@@ -61,7 +54,7 @@ service:
       processors: [memory_limiter, resourcedetection, batch]
       exporters: [debug]
     metrics:
-      receivers: [otlp, prometheus]
+      receivers: [otlp]
       processors: [memory_limiter, resourcedetection, attributes/strip_account_id, batch]
       exporters: [debug]
     logs:

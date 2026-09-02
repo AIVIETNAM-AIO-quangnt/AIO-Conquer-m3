@@ -30,16 +30,13 @@ def ingest_bronze(csv_path: str) -> int:
     from conquer3.pipelines.ingest.bronze import load_csv_to_bronze
 
     # Use track_run to record in ops.pipeline_runs
-    with pg_connection() as conn:
-        with track_run(conn, layer="bronze_ingest") as run:
-            row_count = load_csv_to_bronze(csv_path)
-            run.rows_out = row_count
+    with pg_connection() as conn, track_run(conn, layer="bronze_ingest") as run:
+        row_count = load_csv_to_bronze(csv_path)
+        run.rows_out = row_count
 
-            # Assert exactly 6,362,620 rows
-            if row_count != 6_362_620:
-                raise AssertionError(
-                    f"Expected 6,362,620 rows in bronze.txn_raw, got {row_count}"
-                )
+        # Assert exactly 6,362,620 rows
+        if row_count != 6_362_620:
+            raise AssertionError(f"Expected 6,362,620 rows in bronze.txn_raw, got {row_count}")
 
     print(f"Ingested bronze.txn_raw: {row_count} rows")
     return row_count

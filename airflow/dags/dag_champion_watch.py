@@ -24,10 +24,13 @@ def watch_champion_alias() -> str:
 
     try:
         _model, ref = resolve_champion(settings.model.name)
-        print(f"Champion alias resolved: version={ref.version}, run_id={ref.run_id}, degraded={ref.degraded}")
+        print(
+            f"Champion alias resolved: version={ref.version}, "
+            f"run_id={ref.run_id}, degraded={ref.degraded}"
+        )
         return ref.version
     except Exception as e:
-        raise RuntimeError(f"Failed to resolve champion alias: {e}")
+        raise RuntimeError(f"Failed to resolve champion alias: {e}") from e
 
 
 @task
@@ -42,29 +45,28 @@ def verify_supervisor_synced(registry_version: str) -> str:
 
     settings = get_settings()
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            # Get the most recently recorded deployment
-            cur.execute(
-                "SELECT version, created_at FROM ops.model_deployments "
-                "WHERE model_name = %s ORDER BY created_at DESC LIMIT 1",
-                (settings.model.name,),
+    with pg_connection() as conn, conn.cursor() as cur:
+        # Get the most recently recorded deployment
+        cur.execute(
+            "SELECT version, created_at FROM ops.model_deployments "
+            "WHERE model_name = %s ORDER BY created_at DESC LIMIT 1",
+            (settings.model.name,),
+        )
+        result = cur.fetchone()
+
+        if result is None:
+            raise AssertionError(
+                f"No deployment recorded yet for {settings.model.name} "
+                "(supervisor may not have started)"
             )
-            result = cur.fetchone()
 
-            if result is None:
-                raise AssertionError(
-                    f"No deployment recorded yet for {settings.model.name} "
-                    "(supervisor may not have started)"
-                )
+        recorded_version, recorded_at = result
 
-            recorded_version, recorded_at = result
-
-            if recorded_version != registry_version:
-                raise AssertionError(
-                    f"Supervisor out of sync: registry says {registry_version}, "
-                    f"ops.model_deployments says {recorded_version} (as of {recorded_at})"
-                )
+        if recorded_version != registry_version:
+            raise AssertionError(
+                f"Supervisor out of sync: registry says {registry_version}, "
+                f"ops.model_deployments says {recorded_version} (as of {recorded_at})"
+            )
 
     print(f"Supervisor in sync: both track version {registry_version}")
     return f"synced: {registry_version}"
@@ -86,27 +88,26 @@ def check_deployment_freshness(registry_version: str) -> str:
     poll_interval_s = settings.c3.champion_poll_s
     max_age_s = poll_interval_s * 2  # Allow 2x the poll interval before alerting
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT created_at FROM ops.model_deployments "
-                "WHERE model_name = %s AND version = %s ORDER BY created_at DESC LIMIT 1",
-                (settings.model.name, registry_version),
+    with pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT created_at FROM ops.model_deployments "
+            "WHERE model_name = %s AND version = %s ORDER BY created_at DESC LIMIT 1",
+            (settings.model.name, registry_version),
+        )
+        result = cur.fetchone()
+
+        if result is None:
+            raise AssertionError(f"No deployment record found for version {registry_version}")
+
+        recorded_at = result[0]
+        now = dt.datetime.now(dt.UTC)
+        age_s = (now - recorded_at).total_seconds()
+
+        if age_s > max_age_s:
+            raise AssertionError(
+                f"Deployment record stale: recorded {age_s:.0f}s ago (>max {max_age_s}s). "
+                f"Supervisor may have crashed or is unresponsive."
             )
-            result = cur.fetchone()
-
-            if result is None:
-                raise AssertionError(f"No deployment record found for version {registry_version}")
-
-            recorded_at = result[0]
-            now = dt.datetime.now(dt.timezone.utc)
-            age_s = (now - recorded_at).total_seconds()
-
-            if age_s > max_age_s:
-                raise AssertionError(
-                    f"Deployment record stale: recorded {age_s:.0f}s ago (>max {max_age_s}s). "
-                    f"Supervisor may have crashed or is unresponsive."
-                )
 
     print(f"Deployment record fresh: recorded {age_s:.1f}s ago (max {max_age_s}s)")
     return f"fresh: {age_s:.1f}s old"
@@ -118,9 +119,8 @@ def record_watch_run() -> str:
     from conquer3.db.engine import pg_connection
     from conquer3.db.ops import track_run
 
-    with pg_connection() as conn:
-        with track_run(conn, layer="champion_watch") as run:
-            run.detail = "champion watch completed successfully"
+    with pg_connection() as conn, track_run(conn, layer="champion_watch") as run:
+        run.detail = "champion watch completed successfully"
 
     print("Watch run recorded in ops.pipeline_runs")
     return "recorded"

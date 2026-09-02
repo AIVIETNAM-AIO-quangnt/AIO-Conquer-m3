@@ -39,64 +39,63 @@ def audit_feature_skew() -> str:
 
     mismatches = []
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            # Fetch a sample of scored events for spot-checking
-            cur.execute("""
+    with pg_connection() as conn, conn.cursor() as cur:
+        # Fetch a sample of scored events for spot-checking
+        cur.execute("""
                 SELECT payload FROM bronze.scored_events
                 ORDER BY created_at DESC
                 LIMIT 10000
             """)
-            for (payload_str,) in cur:
-                payload = json.loads(payload_str)
+        for (payload_str,) in cur:
+            payload = json.loads(payload_str)
 
-                # Reconstruct the transaction that was scored
-                txn_dict = payload.get("transaction", {})
-                if not txn_dict:
+            # Reconstruct the transaction that was scored
+            txn_dict = payload.get("transaction", {})
+            if not txn_dict:
+                continue
+
+            txn = TransactionEvent(
+                event_id=txn_dict.get("event_id"),
+                account_id=txn_dict.get("account_id"),
+                dest_id=txn_dict.get("dest_id"),
+                txn_type=txn_dict.get("txn_type"),
+                amount=txn_dict.get("amount"),
+                oldbalance_org=txn_dict.get("oldbalance_org"),
+                newbalance_orig=txn_dict.get("newbalance_orig"),
+                oldbalance_dest=txn_dict.get("oldbalance_dest"),
+                newbalance_dest=txn_dict.get("newbalance_dest"),
+                event_ts_us=txn_dict.get("event_ts_us"),
+                step=txn_dict.get("step"),
+            )
+
+            # For skew audit in batch, we don't have the previous state,
+            # so we recompute with prev=None (cold start). If had_prev_state=true,
+            # the audit should still match because features are deterministic.
+            # This is a limitation of the audit (we'd need to also log prev_state
+            # in the scored event to be 100% precise), but serves as a sanity check.
+            features_recomputed = compute_features(txn, prev=None)
+
+            # Compare against logged features
+            logged_features = payload.get("features", {})
+            for feat_name in FEATURE_NAMES:
+                recomputed_val = getattr(features_recomputed, feat_name, None)
+                logged_val = logged_features.get(feat_name)
+
+                # Handle NaN: both None or both NaN are ok
+                if recomputed_val is None and logged_val is None:
                     continue
-
-                txn = TransactionEvent(
-                    event_id=txn_dict.get("event_id"),
-                    account_id=txn_dict.get("account_id"),
-                    dest_id=txn_dict.get("dest_id"),
-                    txn_type=txn_dict.get("txn_type"),
-                    amount=txn_dict.get("amount"),
-                    oldbalance_org=txn_dict.get("oldbalance_org"),
-                    newbalance_orig=txn_dict.get("newbalance_orig"),
-                    oldbalance_dest=txn_dict.get("oldbalance_dest"),
-                    newbalance_dest=txn_dict.get("newbalance_dest"),
-                    event_ts_us=txn_dict.get("event_ts_us"),
-                    step=txn_dict.get("step"),
-                )
-
-                # For skew audit in batch, we don't have the previous state,
-                # so we recompute with prev=None (cold start). If had_prev_state=true,
-                # the audit should still match because features are deterministic.
-                # This is a limitation of the audit (we'd need to also log prev_state
-                # in the scored event to be 100% precise), but serves as a sanity check.
-                features_recomputed = compute_features(txn, prev=None)
-
-                # Compare against logged features
-                logged_features = payload.get("features", {})
-                for feat_name in FEATURE_NAMES:
-                    recomputed_val = getattr(features_recomputed, feat_name, None)
-                    logged_val = logged_features.get(feat_name)
-
-                    # Handle NaN: both None or both NaN are ok
-                    if recomputed_val is None and logged_val is None:
+                if isinstance(recomputed_val, float) and isinstance(logged_val, float):
+                    if math.isnan(recomputed_val) and math.isnan(logged_val):
                         continue
-                    if isinstance(recomputed_val, float) and isinstance(logged_val, float):
-                        if math.isnan(recomputed_val) and math.isnan(logged_val):
-                            continue
-                        # Allow tiny floating-point differences (~1e-9)
-                        if abs(recomputed_val - logged_val) < 1e-9:
-                            continue
+                    # Allow tiny floating-point differences (~1e-9)
+                    if abs(recomputed_val - logged_val) < 1e-9:
+                        continue
 
-                    # Mismatch
-                    mismatches.append(
-                        f"event_id={txn.event_id}, feature={feat_name}, "
-                        f"recomputed={recomputed_val}, logged={logged_val}"
-                    )
+                # Mismatch
+                mismatches.append(
+                    f"event_id={txn.event_id}, feature={feat_name}, "
+                    f"recomputed={recomputed_val}, logged={logged_val}"
+                )
 
     if mismatches:
         msg = f"Feature skew detected ({len(mismatches)} mismatches):\n" + "\n".join(
@@ -119,7 +118,6 @@ def audit_model_consistency() -> str:
     - Champion artifact is available locally
     - Model signature in artifact matches FEATURE_NAMES
     """
-    import subprocess
 
     from conquer3.config.settings import get_settings
     from conquer3.contracts.model_registry import resolve_champion
@@ -132,22 +130,21 @@ def audit_model_consistency() -> str:
         _model, ref = resolve_champion(settings.mlflow.model_name)
         print(f"Champion resolved: version={ref.version}, degraded={ref.degraded}")
     except Exception as e:
-        raise RuntimeError(f"Failed to resolve champion: {e}")
+        raise RuntimeError(f"Failed to resolve champion: {e}") from e
 
     # Check it's recorded in ops.model_deployments
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT version FROM ops.model_deployments WHERE model_name = %s "
-                "ORDER BY created_at DESC LIMIT 1",
-                (settings.mlflow.model_name,),
+    with pg_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT version FROM ops.model_deployments WHERE model_name = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            (settings.mlflow.model_name,),
+        )
+        result = cur.fetchone()
+        if result is None or result[0] != ref.version:
+            raise AssertionError(
+                f"Deployment record missing or out of sync: "
+                f"registry says {ref.version}, ops says {result[0] if result else 'none'}"
             )
-            result = cur.fetchone()
-            if result is None or result[0] != ref.version:
-                raise AssertionError(
-                    f"Deployment record missing or out of sync: "
-                    f"registry says {ref.version}, ops says {result[0] if result else 'none'}"
-                )
 
     print("Model consistency verified")
     return "model_consistency: ok"
@@ -172,34 +169,35 @@ def audit_state_consistency() -> str:
         state_ttl_s=settings.c3.state_ttl_s,
     )
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            # Sample 100 random accounts
-            cur.execute("""
+    with pg_connection() as conn, conn.cursor() as cur:
+        # Sample 100 random accounts
+        cur.execute("""
                 SELECT account_id, state_json
                 FROM gold.account_state
                 ORDER BY random()
                 LIMIT 100
             """)
-            divergences = []
-            for account_id, pg_state_json in cur:
-                # Read from Redis
-                redis_state_json = state_store.get(account_id)
+        divergences = []
+        for account_id, pg_state_json in cur:
+            # Read from Redis
+            redis_state_json = state_store.get(account_id)
 
-                if redis_state_json is None:
-                    # Cold start: Redis missing state is ok
-                    continue
+            if redis_state_json is None:
+                # Cold start: Redis missing state is ok
+                continue
 
-                pg_state = json.loads(pg_state_json)
-                redis_state = json.loads(redis_state_json)
+            pg_state = json.loads(pg_state_json)
+            redis_state = json.loads(redis_state_json)
 
-                # Compare essentials (last_* anchor block)
-                for key in ["last_txn_id", "last_event_ts_us", "last_amount"]:
-                    if pg_state.get(key) != redis_state.get(key):
-                        divergences.append(f"{account_id}/{key}: pg={pg_state.get(key)}, redis={redis_state.get(key)}")
+            # Compare essentials (last_* anchor block)
+            for key in ["last_txn_id", "last_event_ts_us", "last_amount"]:
+                if pg_state.get(key) != redis_state.get(key):
+                    divergences.append(
+                        f"{account_id}/{key}: pg={pg_state.get(key)}, redis={redis_state.get(key)}"
+                    )
 
-            if divergences:
-                raise AssertionError(f"State divergence detected:\n" + "\n".join(divergences[:10]))
+        if divergences:
+            raise AssertionError("State divergence detected:\n" + "\n".join(divergences[:10]))
 
     print("State consistency verified: Redis and Postgres aligned")
     return "state_consistency: ok"

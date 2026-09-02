@@ -25,6 +25,7 @@ from pathlib import Path
 
 from conquer3.config.settings import EventSettings
 from conquer3.contracts.events import SUCCESS_MARKER, ScoredEvent, event_file_relpath
+from conquer3.telemetry.otel import get_meter
 
 __all__ = ["JsonlEventSink"]
 
@@ -40,22 +41,29 @@ class JsonlEventSink:
         self._current_relpath: str | None = None
         self._last_event_ts_us: int | None = None
         self._last_fsync = 0.0
+        self._append_failure_counter = get_meter(__name__).create_counter(
+            "c3_event_append_failures_total", description="append() calls that raised"
+        )
 
     def append(self, event: ScoredEvent) -> None:
-        relpath = event_file_relpath(
-            event.scored_at_us, hostname=self._hostname, pid=self._pid, worker_id=0
-        )
-        line = event.to_json_line().encode("utf-8")
-        with self._lock:
-            if relpath != self._current_relpath:
-                self._rotate(relpath)
-            assert self._fd is not None
-            os.write(self._fd, line)
-            self._last_event_ts_us = event.scored_at_us
-            now = time.monotonic()
-            if now - self._last_fsync >= self._fsync_interval_s:
-                os.fsync(self._fd)
-                self._last_fsync = now
+        try:
+            relpath = event_file_relpath(
+                event.scored_at_us, hostname=self._hostname, pid=self._pid, worker_id=0
+            )
+            line = event.to_json_line().encode("utf-8")
+            with self._lock:
+                if relpath != self._current_relpath:
+                    self._rotate(relpath)
+                assert self._fd is not None
+                os.write(self._fd, line)
+                self._last_event_ts_us = event.scored_at_us
+                now = time.monotonic()
+                if now - self._last_fsync >= self._fsync_interval_s:
+                    os.fsync(self._fd)
+                    self._last_fsync = now
+        except Exception:
+            self._append_failure_counter.add(1)
+            raise
 
     def _rotate(self, new_relpath: str) -> None:
         if self._fd is not None:

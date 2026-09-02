@@ -1,11 +1,34 @@
 # Remote-export collector config: same receivers/processors as collector.local.yaml,
-# routed to the remote Grafana stack (Prometheus + Loki/Tempo) instead of debug.
-# Selected via C3_OTEL_COLLECTOR_CONFIG=collector.remote.yaml once the remote
-# addresses are known.
+# relayed to the remote LGTM stack's own OTel Collector instead of the `debug`
+# exporter. Selected via C3_OTEL_COLLECTOR_CONFIG=collector.remote.yaml once the
+# remote address is known.
 #
-# `${env:VAR}` is the collector's environment-substitution syntax; every address and
-# credential here comes from .env, so this file never hardcodes an endpoint.
+# The remote host runs a full otel-collector-contrib of its own (already fanning
+# out to its co-located Prometheus/Tempo/Loki), confirmed by probing it directly --
+# so this file relays via plain OTLP to THAT collector's receiver, rather than
+# pushing to Prometheus remote-write / Tempo / Loki individually the way an earlier
+# version of this file did. Two things made that per-backend approach a dead end,
+# both confirmed against the live remote stack, not assumed:
+#   - the remote Prometheus was started with --web.enable-remote-write-receiver=false
+#     (default), so nothing can push metrics into it directly, only scrape it -- and
+#     it has no scrape target for the remote collector's own metrics either.
+#   - Loki's port is never published on the remote host (only reachable from other
+#     containers on ITS OWN docker network, e.g. that host's own collector).
+# Relaying through the remote collector is therefore not just simpler, it is the
+# only path that actually reaches Tempo/Loki at all -- confirmed for traces (a
+# probe span landed in Tempo's search API within seconds). If the remote
+# Prometheus is later reconfigured to accept metrics, nothing here needs to
+# change -- this collector already forwards metrics on the same connection, they
+# have simply had nowhere to land downstream so far (that gap is remote-side, not
+# fixable from this repo).
+#
+# `${env:VAR}` is the collector's environment-substitution syntax; the address
+# comes from .env, so this file never hardcodes an endpoint.
 
+# otlp is the ONLY receiver -- push-only, on purpose. MLflow's scoring server
+# (plan §8.7) exposes no /metrics route to scrape, so every process (scorer,
+# Pathway, Airflow tasks) pushes OTLP instead. This also sidesteps Prometheus
+# multiprocess mode, which any multi-worker scrape endpoint would have forced.
 receivers:
   otlp:
     protocols:
@@ -13,17 +36,6 @@ receivers:
         endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
-  prometheus:
-    config:
-      scrape_configs:
-        - job_name: conquer3-bentoml
-          scrape_interval: 15s
-          static_configs:
-            - targets: ["bentoml:3000"]
-        - job_name: otel-collector-self
-          scrape_interval: 30s
-          static_configs:
-            - targets: ["localhost:8888"]
 
 processors:
   memory_limiter:
@@ -34,6 +46,11 @@ processors:
     detectors: [env, system]
     system:
       hostname_sources: [os]
+  # account_id is per-transaction: ~6.3M distinct values. As a metric label that is
+  # a cardinality bomb that would take Prometheus down. Account IDs belong in traces
+  # and logs only, so this processor runs in the metrics pipeline exclusively.
+  # Stripped here, before crossing onto the remote collector, so it stays true
+  # regardless of what that collector's own config does or doesn't do.
   attributes/strip_account_id:
     actions:
       - key: account_id
@@ -45,44 +62,33 @@ processors:
 extensions:
   health_check:
     endpoint: 0.0.0.0:13133
-  basicauth/prometheus:
-    client_auth:
-      username: ${env:C3_PROM_REMOTE_WRITE_USER}
-      password: ${env:C3_PROM_REMOTE_WRITE_PASSWORD}
-  basicauth/loki:
-    client_auth:
-      username: ${env:C3_LOKI_USER}
-      password: ${env:C3_LOKI_PASSWORD}
 
 exporters:
-  prometheusremotewrite:
-    endpoint: ${env:C3_PROM_REMOTE_WRITE_URL}
-    auth:
-      authenticator: basicauth/prometheus
-  otlp/tempo:
-    endpoint: ${env:C3_OTLP_TEMPO_ENDPOINT}
-  otlphttp/loki:
-    endpoint: ${env:C3_LOKI_ENDPOINT}
-    auth:
-      authenticator: basicauth/loki
-  # Kept alongside the remote exporters (not a replacement for them) so a
+  # Plain OTLP relay to the remote host's own otel-collector -- no auth extension:
+  # confirmed empirically that its OTLP receiver accepts unauthenticated traffic.
+  # insecure: true because the remote address is a bare http:// endpoint, not TLS.
+  otlp/remote:
+    endpoint: ${env:C3_OTEL_REMOTE_ENDPOINT}
+    tls:
+      insecure: true
+  # Kept alongside the remote exporter (not a replacement for it) so a
   # misconfigured remote endpoint shows up as a connection error in THIS
   # container's log, never as a silent drop -- see the Layer 7 gate.
   debug:
     verbosity: normal
 
 service:
-  extensions: [health_check, basicauth/prometheus, basicauth/loki]
+  extensions: [health_check]
   pipelines:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlp/tempo, debug]
+      exporters: [otlp/remote, debug]
     metrics:
-      receivers: [otlp, prometheus]
+      receivers: [otlp]
       processors: [memory_limiter, resourcedetection, attributes/strip_account_id, batch]
-      exporters: [prometheusremotewrite, debug]
+      exporters: [otlp/remote, debug]
     logs:
       receivers: [otlp]
       processors: [memory_limiter, resourcedetection, batch]
-      exporters: [otlphttp/loki, debug]
+      exporters: [otlp/remote, debug]

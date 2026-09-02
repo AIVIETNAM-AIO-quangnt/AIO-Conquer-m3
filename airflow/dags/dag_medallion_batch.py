@@ -11,7 +11,6 @@ from __future__ import annotations
 import datetime
 
 from airflow.sdk import DAG, task
-from airflow.sdk import TriggerRule
 
 
 @task
@@ -25,10 +24,9 @@ def ingest_scored_events() -> str:
     from conquer3.db.ops import track_run
     from conquer3.pipelines.ingest.events_jsonl import ingest_events_jsonl
 
-    with pg_connection() as conn:
-        with track_run(conn, layer="events_ingest") as run:
-            row_count = ingest_events_jsonl(conn)
-            run.rows_out = row_count
+    with pg_connection() as conn, track_run(conn, layer="events_ingest") as run:
+        row_count = ingest_events_jsonl(conn)
+        run.rows_out = row_count
 
     print(f"Ingested {row_count} scored events into bronze.scored_events")
     return f"scored_events: {row_count}"
@@ -59,39 +57,39 @@ def dq_after_silver(row_count: int) -> str:
     """
     from conquer3.db.engine import pg_connection
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            # Check for non-increasing timestamps per account
-            cur.execute("""
-                WITH ordered AS (
-                    SELECT account_id, event_ts_us,
-                           LAG(event_ts_us) OVER (PARTITION BY account_id ORDER BY event_ts_us, event_id)
-                           AS prev_ts
-                    FROM silver.txn
-                )
-                SELECT count(*) FROM ordered WHERE prev_ts IS NOT NULL AND prev_ts > event_ts_us
-            """)
-            result = cur.fetchone()
-            assert result is not None
-            if result[0] > 0:
-                raise AssertionError(f"Found {result[0]} out-of-order timestamps in silver.txn")
+    with pg_connection() as conn, conn.cursor() as cur:
+        # Check for non-increasing timestamps per account
+        cur.execute("""
+            WITH ordered AS (
+                SELECT account_id, event_ts_us,
+                       LAG(event_ts_us) OVER (
+                           PARTITION BY account_id ORDER BY event_ts_us, event_id
+                       ) AS prev_ts
+                FROM silver.txn
+            )
+            SELECT count(*) FROM ordered WHERE prev_ts IS NOT NULL AND prev_ts > event_ts_us
+        """)
+        result = cur.fetchone()
+        assert result is not None
+        if result[0] > 0:
+            raise AssertionError(f"Found {result[0]} out-of-order timestamps in silver.txn")
 
-            # Check for null event_ts_us
-            cur.execute("SELECT count(*) FROM silver.txn WHERE event_ts_us IS NULL")
-            result = cur.fetchone()
-            assert result is not None
-            if result[0] > 0:
-                raise AssertionError(f"Found {result[0]} null event_ts_us values")
+        # Check for null event_ts_us
+        cur.execute("SELECT count(*) FROM silver.txn WHERE event_ts_us IS NULL")
+        result = cur.fetchone()
+        assert result is not None
+        if result[0] > 0:
+            raise AssertionError(f"Found {result[0]} null event_ts_us values")
 
-            # Check for non-finite amounts/balances
-            cur.execute("""
-                SELECT count(*) FROM silver.txn
-                WHERE amount IS NOT NULL AND (amount != amount OR amount = 'Infinity'::float8)
-            """)
-            result = cur.fetchone()
-            assert result is not None
-            if result[0] > 0:
-                raise AssertionError(f"Found {result[0]} non-finite amounts")
+        # Check for non-finite amounts/balances
+        cur.execute("""
+            SELECT count(*) FROM silver.txn
+            WHERE amount IS NOT NULL AND (amount != amount OR amount = 'Infinity'::float8)
+        """)
+        result = cur.fetchone()
+        assert result is not None
+        if result[0] > 0:
+            raise AssertionError(f"Found {result[0]} non-finite amounts")
 
     print("silver.txn data quality checks passed")
     return "silver DQ passed"
@@ -126,27 +124,28 @@ def dq_after_gold(row_count: int) -> str:
     - is_fraud only in TRANSFER/CASH_OUT transactions
     - is_first_txn count == distinct accounts
     """
-    from conquer3.core.schema import FEATURE_NAMES, NUMERIC_FEATURES
+    from conquer3.core.schema import NUMERIC_FEATURES
     from conquer3.db.engine import pg_connection
 
-    with pg_connection() as conn:
-        with conn.cursor() as cur:
-            # Check row count parity
-            cur.execute("SELECT count(*) FROM silver.txn")
-            silver_count = cur.fetchone()[0]
-            cur.execute("SELECT count(*) FROM gold.txn_features")
-            gold_count = cur.fetchone()[0]
-            if silver_count != gold_count:
-                raise AssertionError(f"Row count mismatch: silver={silver_count}, gold={gold_count}")
+    with pg_connection() as conn, conn.cursor() as cur:
+        # Check row count parity
+        cur.execute("SELECT count(*) FROM silver.txn")
+        silver_count = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM gold.txn_features")
+        gold_count = cur.fetchone()[0]
+        if silver_count != gold_count:
+            raise AssertionError(f"Row count mismatch: silver={silver_count}, gold={gold_count}")
 
-            # Check fraud rate
-            cur.execute("SELECT count(*) FILTER (WHERE is_fraud) / count(*)::float FROM gold.txn_features")
-            fraud_rate = cur.fetchone()[0]
-            if not (0.001 <= fraud_rate <= 0.002):
-                raise AssertionError(f"Fraud rate {fraud_rate} out of bounds [0.001, 0.002]")
+        # Check fraud rate
+        cur.execute(
+            "SELECT count(*) FILTER (WHERE is_fraud) / count(*)::float FROM gold.txn_features"
+        )
+        fraud_rate = cur.fetchone()[0]
+        if not (0.001 <= fraud_rate <= 0.002):
+            raise AssertionError(f"Fraud rate {fraud_rate} out of bounds [0.001, 0.002]")
 
-            # Check is_fraud only in TRANSFER/CASH_OUT (from silver view)
-            cur.execute("""
+        # Check is_fraud only in TRANSFER/CASH_OUT (from silver view)
+        cur.execute("""
                 SELECT count(*) FROM gold.txn_features g
                 WHERE g.is_fraud = true
                 AND g.event_id NOT IN (
@@ -154,21 +153,21 @@ def dq_after_gold(row_count: int) -> str:
                     WHERE s.txn_type IN ('TRANSFER', 'CASH_OUT')
                 )
             """)
-            fraud_type_violations = cur.fetchone()[0]
-            if fraud_type_violations > 0:
-                raise AssertionError(
-                    f"Found {fraud_type_violations} fraud labels on non-TRANSFER/CASH_OUT txns"
-                )
+        fraud_type_violations = cur.fetchone()[0]
+        if fraud_type_violations > 0:
+            raise AssertionError(
+                f"Found {fraud_type_violations} fraud labels on non-TRANSFER/CASH_OUT txns"
+            )
 
-            # Check no inf in numeric features
-            for feat in NUMERIC_FEATURES:
-                cur.execute(f"""
+        # Check no inf in numeric features
+        for feat in NUMERIC_FEATURES:
+            cur.execute(f"""
                     SELECT count(*) FROM gold.txn_features
                     WHERE "{feat}" = 'Infinity'::float8 OR "{feat}" = '-Infinity'::float8
                 """)
-                inf_count = cur.fetchone()[0]
-                if inf_count > 0:
-                    raise AssertionError(f"Found {inf_count} infinite values in {feat}")
+            inf_count = cur.fetchone()[0]
+            if inf_count > 0:
+                raise AssertionError(f"Found {inf_count} infinite values in {feat}")
 
     print("gold.txn_features data quality checks passed")
     return "gold DQ passed"
@@ -197,7 +196,10 @@ def trigger_feature_backfill() -> str:
 
 with DAG(
     dag_id="dag_medallion_batch",
-    description="Layer 6 gate 3: Hourly medallion batch transforms (events → bronze → silver → gold → staging)",
+    description=(
+        "Layer 6 gate 3: Hourly medallion batch transforms "
+        "(events → bronze → silver → gold → staging)"
+    ),
     start_date=datetime.datetime(2024, 1, 1, tzinfo=datetime.UTC),
     schedule="@hourly",
     catchup=False,
