@@ -192,6 +192,25 @@ def _record_deployment(ref: ModelRef) -> None:
         )
 
 
+def _cmd_replay(args: argparse.Namespace) -> int:
+    from conquer3.config.settings import get_settings
+    from conquer3.producer.replay import run_replay
+
+    settings = get_settings()
+    csv_path = args.csv or settings.kaggle.csv_path
+    endpoint = args.endpoint or f"http://127.0.0.1:{settings.serving.scorer_port}"
+    run_replay(
+        csv_path,
+        args.out,
+        endpoint=endpoint,
+        batch_size=args.batch_size,
+        dry_run=args.dry_run,
+        timeout_s=args.timeout,
+        limit=args.limit,
+    )
+    return 0
+
+
 def _cmd_serve(_: argparse.Namespace) -> int:
     from conquer3.config.settings import get_settings
     from conquer3.serving.supervisor import serve
@@ -279,8 +298,30 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_champion.set_defaults(handler=_cmd_model_resolve_champion)
 
     sub.add_parser(
-        "serve", help="run the scoring service: resolve champion, serve /invocations (Layer 5)"
+        "serve", help="run the scoring service: resolve champion, serve /predict (Layer 5)"
     ).set_defaults(handler=_cmd_serve)
+
+    replay = sub.add_parser(
+        "replay", help="replay a raw PaySim1 CSV against /predict, for offline evaluation"
+    )
+    replay.add_argument("--csv", default=None, help="input CSV (default: C3_PAYSIM_CSV_PATH)")
+    replay.add_argument(
+        "--out", required=True, help="output CSV: ground truth + prediction, one row each"
+    )
+    replay.add_argument(
+        "--endpoint",
+        default=None,
+        help="scorer base URL (default: http://127.0.0.1:$C3_SCORER_PORT)",
+    )
+    replay.add_argument(
+        "--batch-size", type=int, default=200, help="transactions per /predict call"
+    )
+    replay.add_argument("--limit", type=int, default=None, help="only replay the first N rows")
+    replay.add_argument(
+        "--dry-run", action="store_true", help="score without writing Redis state or event logs"
+    )
+    replay.add_argument("--timeout", type=float, default=30.0, help="per-request timeout, seconds")
+    replay.set_defaults(handler=_cmd_replay)
 
     return parser
 

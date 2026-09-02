@@ -22,7 +22,7 @@ pass before the next one starts.
 | 3 — Feature core | (built as part of Layer 0; Pathway wiring is Layer 3b) | ✅ Done — `scripts/smoke/layer3_feature_core.sh` |
 | 3b — Pathway | Batch backfill + streaming state repair | ✅ Done — `scripts/smoke/layer3b_pathway.sh` |
 | 4 — Model contract | MLflow publish/resolve (`contracts/model_registry.py`) | ✅ Done — `scripts/smoke/layer4_model_registry.sh` |
-| 5 — Serving | `scorer` (MLflow's own scoring server as a library), Redis state store, event sink | ✅ Done — `scripts/smoke/layer5_serving.sh` |
+| 5 — Serving | `scorer` (a BentoML service: `POST /predict`, `POST /model_info`, deprecated `POST /invocations`; OpenAPI spec at `/docs.json`), Redis state store, event sink | ✅ Done — `scripts/smoke/layer5_serving.sh`. Champion promotion restarts the server (a bounded connection-refused window, budgeted ≤25s), trading the previous SIGHUP-reload's brief overlap for a real OpenAPI spec, `/readyz`/`/livez`, and Prometheus `/metrics` |
 | 6 — Airflow DAGs | Bootstrap/ingest/medallion/DQ/skew-audit/champion-watch DAGs | ⬜ Not started (only the `hello_world` smoke DAG exists) |
 | 7 — Observability | `telemetry/otel.py` (traces+metrics+logs), redis-get→predict→redis-set→file-append spans, `c3_*` metrics — pushed straight to a remote LGTM stack's own collector, no local collector container | 🟡 Traces and logs confirmed landing in Tempo/Loki end to end; metrics have nowhere to land until the remote Prometheus enables its remote-write receiver (or gets a scrape target) — see `.env`'s observability section — `scripts/smoke/layer7_observability.sh` |
 | 8 — Colab notebook | Training template | ⬜ Not started |
@@ -164,11 +164,10 @@ uv run pytest -s tests/unit/test_model_registry.py::test_log_current_champion_fr
 
 `scorer` needs a champion to resolve at boot, so publish one first (a throwaway
 `DummyClassifier` is fine for a smoke run -- swap in a real Colab-trained model
-once Layer 8 exists). `C3_SCORER_WORKERS` must stay `>= 2`: with exactly one
-worker, uvicorn installs no `SIGHUP` handler at all, so a champion promotion
-would kill the process instead of reloading it (`conquer3 serve` refuses to
-start below 2, so a misconfigured `.env` fails loudly at boot, not silently on
-the first promotion).
+once Layer 8 exists). The service is a BentoML app: a full OpenAPI 3 document is
+served at `/docs.json`, with an interactive Swagger UI at `/` -- open it in a
+browser for a live, always-current description of every route instead of the
+prose below.
 
 **Without Docker** (needs `core` profile's Redis up; a real `MLFLOW_TRACKING_URI`
 in `.env`, or `mlflow server` in a second terminal for a fully local demo --
@@ -187,37 +186,42 @@ uv run conquer3 serve                                      # resolves it, boots 
 In another terminal:
 
 ```bash
-curl http://localhost:3000/ping                            # one of MLflow's four fixed routes
+curl http://localhost:3000/readyz                          # 500 until the champion is loaded
 
-curl -X POST http://localhost:3000/invocations \
+curl -X POST http://localhost:3000/predict \
   -H 'Content-Type: application/json' \
-  -d '{"dataframe_records": [{"event_id": "e1", "account_id": "C1", "dest_id": "M900",
+  -d '{"transactions": [{"event_id": "e1", "account_id": "C1", "dest_id": "M900",
         "txn_type": "TRANSFER", "amount": 181.0, "oldbalance_org": 181.0,
         "newbalance_orig": 0.0, "oldbalance_dest": 0.0, "newbalance_dest": 181.0,
         "event_ts_us": 1700000000000000, "step": 1}]}'
-#   -> {"predictions": [{"event_id": "e1", "fraud_score": ..., "decision": "...",
+#   -> [{"event_id": "e1", "fraud_score": ..., "decision": "...",
 #        "had_prev_state": false, "seconds_since_last_txn": null,
-#        "model_version": "1", "feature_schema_version": 1, "degraded": false}]}
+#        "model_version": "1", "feature_schema_version": 1, "degraded": false}]
 
 # Send it again with a later event_ts_us for the same account_id: had_prev_state
 # flips to true and seconds_since_last_txn is no longer null -- state round-
 # tripped through Redis between the two calls.
 
-curl -X POST http://localhost:3000/invocations \
-  -H 'Content-Type: application/json' \
-  -d '{"dataframe_records": [{"event_id": "_", "account_id": "_", "dest_id": "_",
-        "txn_type": "TRANSFER", "amount": 0, "oldbalance_org": 0, "newbalance_orig": 0,
-        "oldbalance_dest": 0, "newbalance_dest": 0, "event_ts_us": 0, "step": 0}],
-      "params": {"op": "model_info"}}'
-#   -> the resolved ModelRef (name/version/run_id/alias/degraded) as one row.
-#      The row above is ignored by op=model_info but still required -- MLflow
-#      enforces the input schema before predict() ever runs, regardless of op.
+curl -X POST http://localhost:3000/model_info -H 'Content-Type: application/json' -d '{}'
+#   -> the resolved ModelRef (name/version/run_id/alias/degraded), typed and
+#      requiring no body -- unlike the old op=model_info, which needed a
+#      syntactically valid placeholder transaction row.
 ```
+
+A deprecated `POST /invocations` route accepts the previous MLflow envelope
+(`dataframe_records` / `params: {op, dry_run}` -> `{"predictions": [...]}`) for
+callers not yet migrated; it is a thin adapter over `/predict` and
+`/model_info`, so it can never disagree with them, and `/docs.json` marks it
+deprecated.
 
 Promote a new champion in another terminal (`conquer3 model publish-dummy
 --alias-champion` again) and `scorer` picks it up within `C3_CHAMPION_POLL_S`
-(default 300s locally; lower it in `.env` for a faster demo) -- `op=model_info`
-will report the new version, with zero downtime across the switch.
+(default 300s locally; lower it in `.env` for a faster demo) -- `/model_info`
+will report the new version. Unlike the previous MLflow/SIGHUP implementation,
+the switch is a process restart: in-flight requests drain cleanly and no request
+ever gets an error response, but there is a brief window (budgeted at 25s in the
+Layer 5 gate, typically 1-3s in practice) where new connections are refused
+while the replacement boots and reloads the model.
 
 ### MLflow local service (Docker-based)
 
@@ -242,20 +246,27 @@ remote address needs no such thing):
 
 ```bash
 docker compose --profile core --profile serving up -d --build
-docker compose ps scorer                                   # healthy once /ping responds
-curl http://localhost:${C3_SCORER_PORT:-3000}/ping
+docker compose ps scorer                                   # healthy once /readyz responds
+curl http://localhost:${C3_SCORER_PORT:-3000}/readyz
 ```
 
 ### Transaction input/output schema
 
-`POST /invocations` accepts `dataframe_records` with 11 required fields:
+The definitive schema is served live at `/docs.json` (OpenAPI 3) and rendered as
+Swagger UI at `/` -- both generated from the same pydantic models the routes
+validate against (`src/conquer3/serving/api_models.py`), so they cannot drift
+from what the server actually accepts. The block below is a snapshot for quick
+reference.
+
+`POST /predict` accepts `transactions` with 11 required fields per row, plus an
+optional `dry_run`:
 
 ```json
 {
-  "dataframe_records": [
+  "transactions": [
     {
       "event_id": "string",
-      "account_id": "string", 
+      "account_id": "string",
       "dest_id": "string",
       "txn_type": "string (TRANSFER|PAYMENT|CASH_OUT|DEBIT|CASH_IN)",
       "amount": "float",
@@ -267,31 +278,33 @@ curl http://localhost:${C3_SCORER_PORT:-3000}/ping
       "step": "int (simulation step)"
     }
   ],
-  "params": {
-    "op": "score|model_info",
-    "dry_run": true|false
-  }
+  "dry_run": false
 }
 ```
 
-Response:
+Response (a JSON array, one row per input transaction, same order):
 
 ```json
-{
-  "predictions": [
-    {
-      "event_id": "string",
-      "fraud_score": "float (0.0-1.0)",
-      "decision": "fraud|legitimate",
-      "had_prev_state": "bool",
-      "seconds_since_last_txn": "float | null",
-      "model_version": "string",
-      "feature_schema_version": "int",
-      "degraded": "bool"
-    }
-  ]
-}
+[
+  {
+    "event_id": "string",
+    "fraud_score": "float (0.0-1.0)",
+    "decision": "FRAUD|LEGIT",
+    "had_prev_state": "bool",
+    "seconds_since_last_txn": "float | null",
+    "model_version": "string",
+    "feature_schema_version": "int",
+    "degraded": "bool"
+  }
+]
 ```
+
+`POST /model_info` takes no body and returns the resolved `ModelRef`
+(`name`/`version`/`run_id`/`alias`/`tags`/`degraded`) as one object.
+
+`POST /invocations` (deprecated) reproduces the previous MLflow envelope --
+`{"dataframe_records": [...], "params": {"op": "score"|"model_info", "dry_run": ...}}`
+in, `{"predictions": [...]}` out -- for callers not yet migrated to `/predict`.
 
 **State tracking:** Scores for the same `account_id` called twice return updated
 state (e.g., `had_prev_state=true`, `seconds_since_last_txn` populated). State
@@ -344,13 +357,17 @@ src/conquer3/
 │                  # semantics by construction
 ├── pipelines/       # ingest/ + transforms/ (Layer 2 + export_staging.py for
 │                  # Layer 3b, done); pathway/ (Layer 3b, done)
-├── serving/        # scorer -- Layer 5, done. pyfunc_model.py (FraudScorerModel:
-│                  # feature computation + Redis + event sink), signature.py
-│                  # (ModelSignature generated from TransactionEvent), build.py
-│                  # (resolve champion -> local wrapper -> symlink swap),
-│                  # supervisor.py (`conquer3 serve`: launches MLflow's own
-│                  # scoring server, polls for champion changes, SIGHUPs to
-│                  # reload), state_store.py, event_sink.py
+├── serving/        # scorer -- Layer 5, done, a BentoML service. scorer.py
+│                  # (FraudScorer: framework-free feature computation + Redis +
+│                  # event sink), api_models.py (pydantic request/response models
+│                  # generated from TransactionEvent -- the OpenAPI 3 spec at
+│                  # /docs.json comes from these), service.py (FraudScorerService:
+│                  # POST /predict, POST /model_info, deprecated POST
+│                  # /invocations), champion.py (supervisor: resolve + pin a
+│                  # version; workers: load from the local cache only),
+│                  # supervisor.py (`conquer3 serve`: launches `bentoml serve`,
+│                  # polls for champion changes, restarts on a version change),
+│                  # state_store.py, event_sink.py
 ├── producer/       # transaction replay driver -- not built yet
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
 
@@ -381,17 +398,16 @@ extra:
 | Extra | Pulls in | Used by |
 |---|---|---|
 | `train` | scikit-learn, pandas, kagglehub, mlflow | Colab notebook (Layer 8) |
-| `serving` | mlflow, fastapi, uvicorn, redis, scikit-learn | `serving/` (Layer 5, done) |
+| `serving` | bentoml, mlflow (via `registry`), redis, scikit-learn | `serving/` (Layer 5, done) |
 | `pipeline` | ibis, duckdb, polars, psycopg | `db/`, `pipelines/` (Layer 2) |
 | `stream` | pathway, redis, psycopg | `pipelines/pathway/` (Layer 3b, done) |
 | `registry` | mlflow (full, not `-skinny`) | `contracts/model_registry.py` |
 
-`fastapi`/`uvicorn` are listed explicitly, not inherited from `mlflow` itself:
-confirmed by reading `mlflow.pyfunc.scoring_server`'s source that it imports
-them lazily, inside `scoring_server.init()`, and the base `mlflow` package does
-not declare them as dependencies at all -- only mlflow's own `gateway`/`genai`
-extras do (and those pull in unrelated things like `boto3`/`tiktoken`). `scorer`
-depends on exactly what its own scoring server needs, directly.
+`bentoml` owns the web stack (its own starlette/uvicorn, not pinned here) and,
+more to the point, the OpenAPI document it derives from `serving/api_models.py`'s
+pydantic models. `mlflow` is still pulled in via `registry`, but only to resolve
+and load the champion artifact -- nothing in a worker process serves HTTP
+through it.
 
 `uv sync --all-extras` installs everything for local development. Each Docker image
 installs only what it needs — see `docker/*.Dockerfile`.
