@@ -78,6 +78,17 @@ producer = [
   "pandas>=2.2",
   "httpx>=0.27",
 ]
+ui = [
+  # producer: pandas + httpx, reused for CSV upload validation and the scorer
+  # HTTP client. registry: full mlflow, to list/promote versions through the
+  # single module that owns the MLflow contract (contracts/model_registry.py)
+  # rather than a second, hand-rolled REST client.
+  "conquer3[producer,registry]",
+  "streamlit>=1.40",
+  "scikit-learn>=1.5,<1.8",   # precision / recall / fbeta / PR / ROC
+  "psycopg[binary]>=3.2",     # ops.prediction_labels
+  "pydantic-settings>=2.4",
+]
 
 [dependency-groups]
 # uv-only tooling; never ships in any image.
@@ -115,7 +126,7 @@ forbidden_modules = [
   "joblib", "psycopg", "opentelemetry",
   "conquer3.config", "conquer3.db", "conquer3.serving",
   "conquer3.pipelines", "conquer3.contracts", "conquer3.telemetry",
-  "conquer3.redis_scripts",
+  "conquer3.redis_scripts", "conquer3.ui",
 ]
 
 [[tool.importlinter.contracts]]
@@ -143,9 +154,26 @@ source_modules = ["conquer3.pipelines"]
 forbidden_modules = ["conquer3.serving"]
 
 [[tool.importlinter.contracts]]
+name = "ui talks to serving over HTTP, never by import"
+type = "forbidden"
+source_modules = ["conquer3.ui"]
+# Not ibis/duckdb: conquer3.ui.labels legitimately reaches db.engine.pg_connection,
+# and db.engine is *also* (correctly) db.get_ibis_connection's home -- import-linter's
+# "forbidden" contract walks the whole transitive graph, so ibis/duckdb would always
+# be "reachable" through that one shared module regardless of db.engine's own lazy
+# import. The invariant this contract actually protects is narrower: ui must never
+# import serving code (or bentoml) directly, since that would pull the scoring
+# service itself into the UI image instead of talking to it over HTTP.
+forbidden_modules = ["conquer3.serving", "bentoml", "pathway"]
+
+[[tool.importlinter.contracts]]
 name = "layered architecture"
 type = "layers"
 layers = [
+  # ui sits above serving|producer|pipelines (not a sibling): it imports
+  # producer.replay for CSV validation, which import-linter's "|" siblings may
+  # not do to each other.
+  "conquer3.ui",
   "conquer3.serving | conquer3.producer | conquer3.pipelines",
   "conquer3.db",
   "conquer3.contracts",
@@ -178,7 +206,7 @@ mypy_path = "src"
 [[tool.mypy.overrides]]
 module = [
   "kagglehub.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*",
-  "pandas.*", "sklearn.*",
+  "pandas.*", "sklearn.*", "streamlit.*",
 ]
 ignore_missing_imports = true
 

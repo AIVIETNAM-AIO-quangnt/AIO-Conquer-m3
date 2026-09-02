@@ -145,6 +145,18 @@ else
 fi
 
 echo
+echo "== profile: ui (Streamlit console) =="
+if [ -z "$mlflow_uri" ]; then
+  echo "  skipped: serving wasn't started above (no MLFLOW_TRACKING_URI), so ui has no"
+  echo "  scorer to talk to. Once scorer is up, run:"
+  echo "    docker compose --profile core --profile serving --profile ui up -d --build"
+else
+  export COMPOSE_PROFILES="${COMPOSE_PROFILES},ui"
+  docker compose up -d --build
+  wait_healthy ui
+fi
+
+echo
 echo "== infrastructure up =="
 docker compose ps
 echo
@@ -152,7 +164,9 @@ echo "Airflow UI:  http://localhost:8080  (user/pass from _AIRFLOW_WWW_USER_* in
 echo "otel-collector health: http://localhost:13133"
 if [ -n "$mlflow_uri" ]; then
   scorer_port="$(grep -E '^C3_SCORER_PORT=' .env | cut -d= -f2- || true)"
+  ui_port="$(grep -E '^C3_UI_PORT=' .env | cut -d= -f2- || true)"
   echo "scorer:      http://localhost:${scorer_port:-3000}/docs.json (Swagger UI at /)"
+  echo "ui:          http://localhost:${ui_port:-8501}"
 fi
 echo
 echo "Next: scripts/smoke/layer1_infra.sh (and the rest of scripts/smoke/) to verify"

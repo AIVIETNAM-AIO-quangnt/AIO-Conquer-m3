@@ -15,11 +15,14 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-import ibis
 import psycopg
 
 from conquer3.config.settings import DuckSettings, PgSettings, get_settings
+
+if TYPE_CHECKING:
+    import ibis
 
 __all__ = ["get_ibis_connection", "pg_connection"]
 
@@ -42,7 +45,13 @@ def get_ibis_connection(
 
     Call ``.disconnect()`` (or use as a context manager) when done -- the DuckDB file
     is held open until then.
+
+    ``ibis`` is imported here, not at module level, so that ``pg_connection`` above
+    stays usable without dragging ibis/duckdb into a process that only needs plain
+    Postgres (e.g. ``conquer3.ui``, which must not gain the pipeline extra's weight).
     """
+    import ibis
+
     duck_settings = duck if duck is not None else get_settings().duck
     pg_settings = pg if pg is not None else get_settings().pg
 

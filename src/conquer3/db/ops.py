@@ -6,7 +6,7 @@ leaves an audit trail Layer 6's DQ/skew-audit DAGs can read later.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -14,7 +14,14 @@ import psycopg
 
 from conquer3.contracts.model_registry import ModelRef
 
-__all__ = ["RunHandle", "record_model_deployment", "track_run"]
+__all__ = [
+    "RunHandle",
+    "delete_prediction_labels",
+    "fetch_prediction_labels",
+    "record_model_deployment",
+    "track_run",
+    "upsert_prediction_labels",
+]
 
 
 @dataclass
@@ -47,6 +54,58 @@ def track_run(conn: psycopg.Connection, layer: str) -> Iterator[RunHandle]:
         raise
     else:
         _finish(conn, run_id, status="success", handle=handle, detail=handle.detail)
+
+
+@dataclass(frozen=True, slots=True)
+class PredictionLabel:
+    event_id: str
+    is_fraud: bool
+    source: str  # 'ui' | 'csv'
+
+
+def upsert_prediction_labels(conn: psycopg.Connection, rows: Sequence[PredictionLabel]) -> None:
+    """Writes ground-truth labels for the UI's Inspection tab -- ``ops.prediction_labels``
+    (``db/ddl/45_ops_labels.sql``). ``event_id`` is the primary key, so re-labeling an
+    already-labeled prediction updates it in place rather than erroring.
+    """
+    if not rows:
+        return
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO ops.prediction_labels (event_id, is_fraud, source) "
+            "VALUES (%s, %s, %s) "
+            "ON CONFLICT (event_id) DO UPDATE SET "
+            "is_fraud = EXCLUDED.is_fraud, source = EXCLUDED.source, labeled_at = now()",
+            [(r.event_id, r.is_fraud, r.source) for r in rows],
+        )
+
+
+def fetch_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str]) -> dict[str, bool]:
+    """Ground truth for the given ``event_id``s. An id absent from the returned
+    mapping is ``unlabeled`` -- that third state is row absence, not a column value
+    (``is_fraud`` is ``NOT NULL``), so callers must not default a missing key to
+    ``False``.
+    """
+    if not event_ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_id, is_fraud FROM ops.prediction_labels WHERE event_id = ANY(%s)",
+            (list(event_ids),),
+        )
+        return dict(cur.fetchall())
+
+
+def delete_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str]) -> None:
+    """Moves the given predictions back to ``unlabeled`` by removing their row --
+    the Inspection tab's three-state label editor calls this when a row is set back
+    to ``unlabeled`` rather than ``fraud``/``legit``."""
+    if not event_ids:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM ops.prediction_labels WHERE event_id = ANY(%s)", (list(event_ids),)
+        )
 
 
 def record_model_deployment(conn: psycopg.Connection, ref: ModelRef) -> None:

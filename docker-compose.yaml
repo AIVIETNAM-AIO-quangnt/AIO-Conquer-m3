@@ -353,6 +353,48 @@ services:
     # conquer3 serve (src/conquer3/serving/supervisor.py) -- Layer 5:
     # resolves the champion, then supervises a `bentoml serve` child.
 
+  # ─────────────────────────────── ui ───────────────────────────────
+  # Streamlit console (Layer 9): Inference + Inspection tabs. A client of scorer
+  # over HTTP -- holds no model, computes no feature. On its own profile since it
+  # is a standalone, optional add-on: bringing it up also needs `serving` (for
+  # `scorer`) and `core` (for `postgres`) in scope, e.g.
+  #   docker compose --profile core --profile serving --profile ui up -d --build
+  # `--profile ui` alone cannot resolve `depends_on: scorer` -- the same
+  # profile-scoping hazard scripts/startup.sh already documents for `pathway`.
+  ui:
+    build:
+      context: .
+      dockerfile: docker/ui.Dockerfile
+    profiles: [ui]
+    env_file:
+      - .env
+    # Same host-vs-container-path reasoning as `scorer`/`pathway` above: .env's
+    # own values are host-friendly, these re-point at compose service names.
+    environment:
+      POSTGRES_HOST: postgres
+      C3_SCORER_URL: http://scorer:3000
+      C3_EVENT_DIR: /events
+    ports:
+      - "${C3_UI_PORT:-8501}:8501"
+    volumes:
+      # Read-only: the UI reads scored events for the Inspection tab and never
+      # writes them -- only the scorer's own JsonlEventSink does that.
+      - events:/events:ro
+    networks: [c3net]
+    depends_on:
+      scorer:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+    # conquer3 ui (src/conquer3/ui/app.py via cli.py's `_cmd_ui`) -- Layer 9.
+
   # ──────────────────────────────── demo ────────────────────────────────
   producer:
     build:

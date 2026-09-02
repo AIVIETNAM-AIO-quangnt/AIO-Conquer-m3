@@ -220,6 +220,28 @@ def _cmd_serve(_: argparse.Namespace) -> int:
     return serve(get_settings(), on_deployment=_record_deployment)
 
 
+def _cmd_ui(_: argparse.Namespace) -> int:
+    import subprocess
+
+    from conquer3.config.settings import get_settings
+    from conquer3.ui import app as ui_app
+
+    settings = get_settings()
+    return subprocess.run(
+        [
+            "streamlit",
+            "run",
+            ui_app.__file__,
+            "--server.address",
+            settings.ui.host,
+            "--server.port",
+            str(settings.ui.port),
+            "--server.headless",
+            "true",
+        ]
+    ).returncode
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="conquer3", description="Credit-fraud MLOps platform")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -300,6 +322,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "serve", help="run the scoring service: resolve champion, serve /predict (Layer 5)"
     ).set_defaults(handler=_cmd_serve)
+
+    sub.add_parser(
+        "ui", help="run the Streamlit console: inference + inspection (Layer 9)"
+    ).set_defaults(handler=_cmd_ui)
 
     replay = sub.add_parser(
         "replay", help="replay a raw PaySim1 CSV against /predict, for offline evaluation"

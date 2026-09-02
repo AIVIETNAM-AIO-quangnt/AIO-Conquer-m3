@@ -79,10 +79,19 @@ Nothing starts unless you pick a profile — there's no default "just run
 | `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, separate from the `postgres` warehouse) |
 | `stream` | `pathway` | Feature engine (Layer 3b — static backfill + streaming state repair) |
 | `serving` | `scorer` | Scoring API (Layer 5 — the inference endpoint; see "Running the scorer" below) |
+| `ui` | `ui` | Streamlit console at http://localhost:8501 (Layer 9 — Inference + Inspection tabs; a client of `scorer`, holds no model) |
 | `demo` | `producer` | Transaction replay driver (`producer/replay.py`, not built yet) |
 | `tools` | `adminer` | Postgres UI at http://localhost:8081 |
 
 Combine profiles freely: `docker compose --profile core --profile pipeline up -d`.
+`ui` depends on `scorer` (profile `serving`) and `postgres` (profile `core`), so
+bringing it up alone won't resolve `depends_on` — the same profile-scoping hazard
+`scripts/startup.sh` documents for `pathway`:
+```bash
+docker compose --profile core --profile serving --profile ui up -d --build
+```
+Streamlit has no auth and no multi-tenant isolation — fine for local/demo use,
+not for exposing this port publicly.
 
 MLflow and Grafana/Prometheus/Loki/Tempo are **remote** — never in this file. Point
 at them via `MLFLOW_TRACKING_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` in `.env` once
@@ -369,6 +378,11 @@ src/conquer3/
 │                  # polls for champion changes, restarts on a version change),
 │                  # state_store.py, event_sink.py
 ├── producer/       # transaction replay driver -- not built yet
+├── ui/             # Streamlit console -- Layer 9. app.py (entrypoint: sidebar +
+│                  # tabs), scorer_client.py (HTTP client -- never imports
+│                  # conquer3.serving), history.py (reads /events JSONL),
+│                  # labels.py (ops.prediction_labels), inference.py,
+│                  # inspection.py. A client of `scorer`; holds no model.
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
 
 airflow/

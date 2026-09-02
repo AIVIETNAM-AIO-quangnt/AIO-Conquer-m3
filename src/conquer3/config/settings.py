@@ -151,6 +151,23 @@ class OtelSettings(BaseSettings):
         return bool(self.exporter_otlp_endpoint)
 
 
+class UiSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="C3_UI_", extra="ignore")
+
+    host: str = "0.0.0.0"
+    port: int = 8501
+    # Alias escape hatch, same reasoning as PathwaySettings.license_key and
+    # KaggleSettings.csv_path above -- a bare C3_UI_SCORER_URL would read oddly
+    # next to the existing C3_SCORER_* block this points at.
+    scorer_url: str = Field(default="http://localhost:3000", alias="C3_SCORER_URL")
+    # Bounds the /events JSONL scan so a long-running scorer's accumulated history
+    # can never make the Inspection tab unloadable.
+    history_max_rows: int = 50000
+    history_max_files: int = 200
+    request_batch_size: int = 500
+    request_timeout_s: int = 60
+
+
 class KaggleSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="KAGGLE_", extra="ignore")
 
@@ -186,6 +203,7 @@ _NESTED_SETTINGS_CLASSES: Final[Mapping[str, type[BaseSettings]]] = {
     "duck": DuckSettings,
     "serving": ServingSettings,
     "otel": OtelSettings,
+    "ui": UiSettings,
     "kaggle": KaggleSettings,
 }
 
@@ -207,6 +225,7 @@ class Settings(BaseSettings):
     duck: DuckSettings = Field(default_factory=DuckSettings)
     serving: ServingSettings = Field(default_factory=ServingSettings)
     otel: OtelSettings = Field(default_factory=OtelSettings)
+    ui: UiSettings = Field(default_factory=UiSettings)
     kaggle: KaggleSettings = Field(default_factory=KaggleSettings)
 
     def __init__(self, **kwargs: Any) -> None:

@@ -28,7 +28,10 @@ __all__ = [
     "IncompatibleModelError",
     "ModelRef",
     "ModelRegistryError",
+    "ModelVersionInfo",
     "cached_model_dir",
+    "list_model_versions",
+    "promote_champion",
     "publish_model",
     "resolve_champion",
     "verify_compatible",
@@ -55,6 +58,21 @@ class ModelRef:
     alias: str
     tags: dict[str, str] = field(default_factory=dict)
     degraded: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ModelVersionInfo:
+    """One registered version, for the UI's model-listing table (Layer 9). A read
+    projection over MLflow's own ``ModelVersion`` -- never a second source of truth
+    for what "champion" means; ``aliases`` simply echoes what the registry reports.
+    """
+
+    version: str
+    run_id: str
+    created_at_ms: int
+    tags: dict[str, str]
+    aliases: tuple[str, ...]
+    compatible: bool
 
 
 def verify_compatible(tags: dict[str, str]) -> None:
@@ -181,47 +199,57 @@ def resolve_champion(
         return model, ref
 
 
-def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[ModelRef, PyFuncModel]:
+def _bound_mlflow_calls(settings: Settings) -> None:
+    """Sets the env vars mlflow itself reads to bound every way a sick tracking
+    server can block a caller. Deliberate exception to "config/settings.py is the
+    only place env vars are read" -- these are mlflow's own knobs, not ours.
+
+    Two distinct failure modes, two distinct guards:
+
+    MLFLOW_HTTP_REQUEST_TIMEOUT / _MAX_RETRIES bound a dead tracking server --
+    confirmed empirically that mlflow's defaults (120s timeout + 7 retries with
+    exponential backoff) can block for minutes even though each individual
+    connection attempt is refused instantly.
+
+    MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false forces artifacts to stream
+    through the tracking server, instead of the presigned-URL path mlflow 3.x
+    auto-enables whenever the server advertises it in /server-info. That path
+    hands the client a signed object-store URL and pulls chunks straight from it,
+    bypassing the tracking server entirely -- silently adding a second network
+    dependency the deployment contract never promised. Confirmed empirically: a
+    remote registry returned presigned URLs on host `storage:9000` (its own
+    compose-internal MinIO), so every chunk failed DNS resolution while the
+    server's access log showed nothing but 200s for the presigned-URL requests
+    themselves. The tracking URI is the only endpoint a client is guaranteed to
+    reach, and these artifacts are a few MB, so proxying them costs nothing worth
+    that failure mode.
+
+    MLFLOW_DOWNLOAD_CHUNK_TIMEOUT covers the remaining chunked path, but note what
+    it does *not* cover: mlflow reads it only in CloudArtifactRepository (a direct
+    `s3://`-style artifact root), never in the proxied `mlflow-artifacts:`
+    repository this deployment uses, whose chunk timeout is hardcoded to 10s. It
+    is set for the `s3://` case only -- it is not, and never was, a bound on the
+    presigned path disabled above.
+
+    Called by every entry point that talks to MLflow (resolve, list, promote) so
+    none of them can drift from this bound by a copy-paste omission.
+    """
     import os
 
     import mlflow
-    import mlflow.pyfunc
-    from mlflow.tracking import MlflowClient
 
-    # Deliberate exception to "config/settings.py is the only place env vars are
-    # read" -- this *writes* env vars mlflow itself reads, to bound how long a dead
-    # tracking server can block boot (confirmed empirically: mlflow's defaults of
-    # 120s timeout + 7 retries with exponential backoff can take minutes even
-    # though each individual connection attempt is refused instantly).
-    #
-    # The two below address a *different* failure mode from the registry call: a
-    # tracking server that answers registry API calls fine but cannot actually
-    # deliver artifact bytes.
-    #
-    # MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false forces artifacts to stream
-    # through the tracking server, instead of the presigned-URL path mlflow 3.x
-    # auto-enables whenever the server advertises it in /server-info. That path
-    # hands the client a signed object-store URL and pulls chunks straight from
-    # it, bypassing the tracking server entirely -- silently adding a second
-    # network dependency the deployment contract never promised. Confirmed
-    # empirically: a remote registry returned presigned URLs on host
-    # `storage:9000` (its own compose-internal MinIO), so every chunk failed DNS
-    # resolution while the server's access log showed nothing but 200s for the
-    # presigned-URL requests themselves. The tracking URI is the only endpoint a
-    # client is guaranteed to reach, and these artifacts are a few MB, so
-    # proxying them costs nothing worth that failure mode.
-    #
-    # MLFLOW_DOWNLOAD_CHUNK_TIMEOUT covers the remaining chunked path, but note
-    # what it does *not* cover: mlflow reads it only in CloudArtifactRepository
-    # (a direct `s3://`-style artifact root), never in the proxied
-    # `mlflow-artifacts:` repository this deployment uses, whose chunk timeout is
-    # hardcoded to 10s. It is set for the `s3://` case only -- it is not, and
-    # never was, a bound on the presigned path disabled above.
     os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = str(settings.model.resolve_timeout_s)
     os.environ["MLFLOW_HTTP_REQUEST_MAX_RETRIES"] = str(settings.model.resolve_max_retries)
     os.environ["MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD"] = "false"
     os.environ["MLFLOW_DOWNLOAD_CHUNK_TIMEOUT"] = str(settings.model.resolve_timeout_s)
     mlflow.set_tracking_uri(settings.mlflow.tracking_uri)
+
+
+def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[ModelRef, PyFuncModel]:
+    import mlflow.pyfunc
+    from mlflow.tracking import MlflowClient
+
+    _bound_mlflow_calls(settings)
 
     client = MlflowClient()
     mv = client.get_model_version_by_alias(model_name, alias)
@@ -235,6 +263,72 @@ def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[Mode
         name=model_name, version=mv.version, run_id=mv.run_id, alias=alias, tags=dict(mv.tags)
     )
     return ref, model
+
+
+def list_model_versions(
+    model_name: str | None = None, *, settings: Settings | None = None
+) -> list[ModelVersionInfo]:
+    """Every registered version of ``model_name``, newest first -- the UI's model
+    table (Layer 9). Read-only: never downloads an artifact, only registry
+    metadata, so a slow/broken artifact store can't make this hang (same
+    reasoning as ``test_log_current_champion_from_registry``).
+    """
+    from mlflow.tracking import MlflowClient
+
+    settings = settings or get_settings()
+    model_name = model_name or settings.model.name
+    _bound_mlflow_calls(settings)
+
+    client = MlflowClient()
+    versions = client.search_model_versions(f"name='{model_name}'")
+
+    aliases_by_version: dict[str, list[str]] = {}
+    for alias, version in client.get_registered_model(model_name).aliases.items():
+        aliases_by_version.setdefault(version, []).append(alias)
+
+    infos = [
+        ModelVersionInfo(
+            version=mv.version,
+            run_id=mv.run_id or "",
+            created_at_ms=mv.creation_timestamp,
+            tags=dict(mv.tags),
+            aliases=tuple(sorted(aliases_by_version.get(mv.version, []))),
+            compatible=mv.tags.get("feature_schema_version") == str(FEATURE_SCHEMA_VERSION),
+        )
+        for mv in versions
+    ]
+    return sorted(infos, key=lambda info: int(info.version), reverse=True)
+
+
+def promote_champion(
+    version: str, *, model_name: str | None = None, settings: Settings | None = None
+) -> ModelRef:
+    """Re-aliases ``version`` as the champion. Refuses an incompatible
+    ``feature_schema_version`` *before* re-aliasing -- the scorer's own poll would
+    otherwise pick up an incompatible model at the next tick with no chance to
+    reject it here first.
+
+    This only moves the alias; it does not restart or notify the scorer. The
+    scorer's own poll thread (``serving/supervisor.py``, ``C3_CHAMPION_POLL_S``)
+    is what actually picks up the change and restarts -- by design, MLflow stays
+    off the request path (see ``resolve_champion``'s docstring).
+    """
+    from mlflow.tracking import MlflowClient
+
+    settings = settings or get_settings()
+    model_name = model_name or settings.model.name
+    _bound_mlflow_calls(settings)
+
+    client = MlflowClient()
+    mv = client.get_model_version(model_name, version)
+    verify_compatible(mv.tags)
+
+    alias = settings.model.alias
+    client.set_registered_model_alias(model_name, alias, version)
+    assert mv.run_id is not None
+    return ModelRef(
+        name=model_name, version=version, run_id=mv.run_id, alias=alias, tags=dict(mv.tags)
+    )
 
 
 def cached_model_dir(model_settings: ModelSettings, model_name: str, version: str) -> Path:
