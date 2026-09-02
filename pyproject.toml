@@ -20,8 +20,9 @@ otel = [
 registry = [
   # Full mlflow, NOT mlflow-skinny: logging a model from a skinny env writes
   # `mlflow-skinny` into the model's conda.yaml and breaks container-based serving.
-  # >=3.5 is load-bearing: 2.x's model-serving CLI serves via Flask+gunicorn, 3.5+
-  # via FastAPI+uvicorn -- Layer 5 depends on the latter (see `serving` below).
+  # Layer 5 no longer serves through mlflow at all (BentoML does), so the old
+  # ">=3.5 because its scoring server is FastAPI-based" reason is gone; the floor
+  # stays because Layer 4's registry behaviour is only verified against 3.x.
   "mlflow>=3.5,<4",
 ]
 train = [
@@ -37,15 +38,12 @@ train = [
 ]
 serving = [
   "conquer3[registry,otel]",
-  # mlflow does NOT depend on these unconditionally -- confirmed by reading
-  # mlflow.pyfunc.scoring_server.app's source: it imports fastapi/uvicorn lazily,
-  # inside scoring_server.init(), and only mlflow's own `gateway`/`genai` extras
-  # (which also pull in boto3, tiktoken, etc. -- unrelated to serving a local
-  # sklearn model) declare them as real dependencies. We are the inference
-  # endpoint (not a gateway to anything), so we depend on exactly what
-  # `mlflow.pyfunc.scoring_server` needs, directly and minimally.
-  "fastapi>=0.110",
-  "uvicorn>=0.30",
+  # BentoML owns the web stack (starlette/uvicorn are its own transitive deps,
+  # not ours to pin) and, more to the point, the OpenAPI document: it derives
+  # /docs.json from the pydantic models in serving/api_models.py. mlflow is still
+  # here via `registry`, but only to resolve and load the champion artifact --
+  # nothing in a worker process serves HTTP through it.
+  "bentoml>=1.4,<2",
   "redis>=5.0",
   "scikit-learn>=1.5,<1.8",
   "pandas>=2.2",
@@ -70,6 +68,15 @@ stream = [
   "redis>=5.0",
   "psycopg[binary]>=3.2",
   "pydantic-settings>=2.4",
+]
+producer = [
+  "conquer3[otel]",
+  # Reads a raw PaySim CSV and POSTs it to the scorer's HTTP API -- no mlflow,
+  # duckdb, or bentoml import anywhere in conquer3.producer (see the "layered
+  # architecture" import-linter contract: producer and serving are siblings,
+  # neither may import the other).
+  "pandas>=2.2",
+  "httpx>=0.27",
 ]
 
 [dependency-groups]
@@ -174,6 +181,14 @@ module = [
   "pandas.*", "sklearn.*",
 ]
 ignore_missing_imports = true
+
+# `@bentoml.api` is an overloaded decorator returning `APIMethod[P, R] | Callable[...]`,
+# which mypy cannot resolve to a typed callable, so every route would be reported as
+# "untyped decorator makes function untyped". The route bodies themselves stay fully
+# type-checked; only the decorator's own typing is conceded, and only in this module.
+[[tool.mypy.overrides]]
+module = ["conquer3.serving.service"]
+disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

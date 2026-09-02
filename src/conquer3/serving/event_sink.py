@@ -5,9 +5,10 @@ layout, the ``_SUCCESS`` marker convention) rather than re-deriving any of it --
 that module is stdlib-only specifically so both sides (this sink, and Layer 6's
 ingest DAG) can agree on the layout without sharing a heavyweight dependency.
 
-Uvicorn workers are OS processes, so ``pid`` alone disambiguates one worker's file
-from another's -- the file layout's ``worker_id`` token is always 0 here (a BentoML
-artifact from when workers were something else; see plan §8.6). Within one worker,
+BentoML workers are OS processes, so ``pid`` alone would already disambiguate one
+worker's file from another's; the layout's ``worker_id`` token carries BentoML's
+own worker index anyway, so a file name says which worker wrote it without having
+to correlate pids. Within one worker,
 concurrent request threads share a single fd: appends write via one ``os.write()``
 of the complete line, which Linux guarantees is atomic for an ``O_APPEND`` fd even
 under concurrent writers, so thread interleaving can never truncate a line. Fsync
@@ -31,11 +32,12 @@ __all__ = ["JsonlEventSink"]
 
 
 class JsonlEventSink:
-    def __init__(self, *, event_settings: EventSettings) -> None:
+    def __init__(self, *, event_settings: EventSettings, worker_id: int = 0) -> None:
         self._root = Path(event_settings.dir)
         self._fsync_interval_s = event_settings.fsync_interval_ms / 1000
         self._hostname = socket.gethostname()
         self._pid = os.getpid()
+        self._worker_id = worker_id
         self._lock = threading.Lock()
         self._fd: int | None = None
         self._current_relpath: str | None = None
@@ -48,7 +50,10 @@ class JsonlEventSink:
     def append(self, event: ScoredEvent) -> None:
         try:
             relpath = event_file_relpath(
-                event.scored_at_us, hostname=self._hostname, pid=self._pid, worker_id=0
+                event.scored_at_us,
+                hostname=self._hostname,
+                pid=self._pid,
+                worker_id=self._worker_id,
             )
             line = event.to_json_line().encode("utf-8")
             with self._lock:

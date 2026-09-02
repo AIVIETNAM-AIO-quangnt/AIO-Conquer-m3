@@ -3,8 +3,8 @@ collects it) -- run via subprocess.run() from test_telemetry_instruments.py so i
 global MeterProvider/InMemoryMetricReader setup can't leak into the rest of the
 unit test suite. Same concern as test_otel.py's module docstring.
 
-Exercises FraudScorerModel.predict() (bypassing load_context, same pattern as
-tests/unit/test_pyfunc_model.py) against a real JsonlEventSink, then forces a real
+Exercises FraudScorer.score() (same fakes-for-collaborators pattern as
+tests/unit/test_scorer.py) against a real JsonlEventSink, then forces a real
 append() I/O failure, and prints every recorded metric as JSON so the calling test
 can assert on it.
 """
@@ -15,6 +15,7 @@ import contextlib
 import json
 import os
 import sys
+from typing import Any
 
 import pandas as pd
 from opentelemetry import metrics
@@ -27,12 +28,13 @@ metrics.set_meter_provider(MeterProvider(metric_readers=[_reader]))
 from conquer3.config.settings import EventSettings  # noqa: E402
 from conquer3.contracts.events import ScoredEvent  # noqa: E402
 from conquer3.contracts.model_registry import ModelRef  # noqa: E402
+from conquer3.core.types import TransactionEvent  # noqa: E402
 from conquer3.serving.event_sink import JsonlEventSink  # noqa: E402
-from conquer3.serving.pyfunc_model import FraudScorerModel  # noqa: E402
+from conquer3.serving.scorer import FraudScorer  # noqa: E402
 
 
 class _FakePipe:
-    def predict_proba(self, rows: pd.DataFrame) -> pd.DataFrame:
+    def predict_proba(self, rows: pd.DataFrame) -> Any:
         return pd.DataFrame(
             {
                 0: [0.1 for _ in rows["amount"]],
@@ -56,29 +58,32 @@ class _FakeStateStore:
 def main() -> None:
     tmp_dir = sys.argv[1]
 
-    model = FraudScorerModel()
-    model._pipe = _FakePipe()  # type: ignore[attr-defined]
-    model._ref = ModelRef(name="m", version="1", run_id="r", alias="champion", tags={})  # type: ignore[attr-defined]
-    model._threshold = 0.5  # type: ignore[attr-defined]
-    model._state = _FakeStateStore()  # type: ignore[attr-defined]
     sink = JsonlEventSink(event_settings=EventSettings(dir=tmp_dir))
-    model._sink = sink  # type: ignore[attr-defined]
-    model._init_instruments()  # type: ignore[attr-defined]
+    scorer = FraudScorer(
+        pipe=_FakePipe(),
+        ref=ModelRef(name="m", version="1", run_id="r", alias="champion", tags={}),
+        threshold=0.5,
+        state=_FakeStateStore(),  # type: ignore[arg-type]
+        sink=sink,
+    )
 
-    row = {
-        "event_id": "e1",
-        "account_id": "C1",
-        "dest_id": "C900",
-        "txn_type": "TRANSFER",
-        "amount": 999.0,
-        "oldbalance_org": 1000.0,
-        "newbalance_orig": 1.0,
-        "oldbalance_dest": 0.0,
-        "newbalance_dest": 999.0,
-        "event_ts_us": 1_700_000_000_000_000,
-        "step": 1,
-    }
-    model.predict(None, pd.DataFrame([row]))
+    scorer.score(
+        [
+            TransactionEvent(
+                event_id="e1",
+                account_id="C1",
+                dest_id="C900",
+                txn_type="TRANSFER",
+                amount=999.0,
+                oldbalance_org=1000.0,
+                newbalance_orig=1.0,
+                oldbalance_dest=0.0,
+                newbalance_dest=999.0,
+                event_ts_us=1_700_000_000_000_000,
+                step=1,
+            )
+        ]
+    )
 
     # Force a genuine append() I/O failure: close the fd out from under the sink
     # (same hour, so no rotation happens first), so its next os.write() raises

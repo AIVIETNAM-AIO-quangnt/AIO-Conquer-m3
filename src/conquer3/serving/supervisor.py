@@ -1,39 +1,32 @@
 """``conquer3 serve``'s process supervisor.
 
-Launches MLflow's own scoring server as a **direct child**, using
-``mlflow.pyfunc.scoring_server.get_cmd`` -- the same internal seam
-``mlflow models serve`` itself calls one process deeper (verified by reading
-``mlflow.pyfunc.backend.PyFuncBackend.serve``, ``mlflow==3.15.1``) -- so this
-process owns the uvicorn master PID directly instead of hunting for a grandchild.
-That reused seam is also where the ``bash -c "exec ..."`` launch pattern below
-comes from: without ``exec``, the child would be a shell wrapping uvicorn, and
-this process's PID would belong to bash, not to the process that actually
-understands ``SIGHUP``.
+Owns the two things a BentoML worker must not: contact with remote MLflow, and
+the deployment audit trail.
 
-Every ``C3_CHAMPION_POLL_S`` seconds, a background thread re-runs
-:func:`build_and_activate_champion`. On a version change it ``SIGHUP``s the
-child; uvicorn's own multiprocess supervisor turns that into a graceful
-``restart_all()`` that **aborts the restart and keeps the old workers** if the
-replacement fails to boot -- strictly safer than a hand-rolled reload endpoint,
-and the reason no ``/admin/reload`` route exists anywhere in this layer.
+At boot it resolves the champion (:func:`activate_champion`), records it as the
+active version, then launches ``bentoml serve`` as a direct child. Every
+``C3_CHAMPION_POLL_S`` seconds a background thread re-resolves. On a version
+change it restarts the child so the new workers pick up the new pointer.
 
-``restart_all()`` is asynchronous, best-effort, and has no callback: uvicorn
-never tells this process whether a given ``SIGHUP`` actually landed. Confirmed
-empirically (aborted restarts under host load during this layer's own test
-suite -- ``ERROR: New child process was not ready in time; keeping worker and
-aborting the restart`` in uvicorn's own log): an aborted restart is silent from
-here. So the poll loop does not trust "I sent SIGHUP" as "the new version is
-live" -- it probes the running server for the version it is actually serving
-and only advances its own tracked version (and only calls ``on_deployment``)
-once that is confirmed. An unconfirmed promotion is retried on the *next* poll
-tick rather than being forgotten -- which is what makes ``ops.model_deployments``
-(Layer 6's audit trail, written from ``on_deployment``) trustworthy: a row there
+**The restart is a real cutover window.** ``SIGTERM`` lets BentoML drain -- requests
+already accepted complete normally -- but new connections are refused for as long
+as the replacement takes to boot and load the model (roughly 1-3s). This is the
+one behavioural regression versus the previous MLflow implementation, whose
+``SIGHUP``/``restart_all()`` path overlapped old and new workers. It buys the
+removal of the entire pyfunc-wrapper rebuild (~2-4s of *every* poll tick, changed
+or not), the symlink swap, and the ``C3_SCORER_WORKERS >= 2`` boot constraint that
+existed only because uvicorn installs no SIGHUP handler for a single worker.
+
+What has **not** changed is the thing Layer 6 depends on: ``on_deployment`` fires
+only once the running server is *observed* serving the new version, never on
+"I restarted it". An unconfirmed promotion is retried on the next poll tick
+rather than being forgotten -- which is what makes ``ops.model_deployments``
+(Layer 6's audit trail, read by ``dag_champion_watch``) trustworthy: a row there
 means the switch was observed to actually happen, not merely attempted.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import logging
 import signal
@@ -46,13 +39,15 @@ from contextlib import suppress
 
 from conquer3.config.settings import Settings, get_settings
 from conquer3.contracts.model_registry import ModelRef
-from conquer3.core.types import TransactionEvent
-from conquer3.serving.build import build_and_activate_champion
-from conquer3.serving.signature import TXN_FIELD_NAMES
+from conquer3.serving.champion import activate_champion
 
 __all__ = ["serve"]
 
 _logger = logging.getLogger(__name__)
+
+_SERVICE_IMPORT_PATH = "conquer3.serving.service:FraudScorerService"
+# How long to wait for a SIGTERM'd child to drain before escalating to SIGKILL.
+_DRAIN_TIMEOUT_S = 30.0
 
 
 def serve(
@@ -61,68 +56,94 @@ def serve(
     on_deployment: Callable[[ModelRef], None] | None = None,
     stop_event: threading.Event | None = None,
 ) -> int:
-    """Builds + activates the champion, launches the scoring server as a child,
-    starts the champion-poll thread, and blocks until the child exits. Returns
-    the child's exit code. ``on_deployment`` is called (from this thread, at
-    boot, and from the poll thread on every version change) with the resolved
+    """Activates the champion, launches ``bentoml serve`` as a child, starts the
+    champion-poll thread, and blocks until the child exits. Returns the child's
+    exit code. ``on_deployment`` is called (from this thread, at boot, and from
+    the poll thread on every confirmed version change) with the resolved
     ``ModelRef`` -- callers outside ``conquer3.serving`` use it to record an
     audit-trail row, since this package may never import ``conquer3.db``
     (import-linter forbids it; see ``db/ops.py``'s ``record_model_deployment``).
     """
     settings = settings or get_settings()
-    serving = settings.serving
 
-    # uvicorn only installs its SIGHUP-handling Multiprocess supervisor when
-    # workers > 1 (confirmed by reading uvicorn.main, uvicorn==0.52.4): with
-    # exactly one worker it runs the bare Server with no signal handling of its
-    # own, so SIGHUP falls through to the OS default (terminate) instead of
-    # reloading. Confirmed empirically -- C3_SCORER_WORKERS=1 does not "skip
-    # reloads", it kills the whole scorer on the first champion promotion.
-    if serving.scorer_workers < 2:
-        raise ValueError(
-            f"C3_SCORER_WORKERS={serving.scorer_workers} but must be >= 2: with "
-            "exactly one worker, uvicorn installs no SIGHUP handler at all, so "
-            "the champion-poll thread's reload signal terminates the whole "
-            "scorer instead of reloading it."
-        )
-
-    ref = build_and_activate_champion(settings)
+    ref = activate_champion(settings)
     _notify(on_deployment, ref)
 
-    import mlflow.pyfunc.scoring_server as scoring_server
-
-    command, env = scoring_server.get_cmd(
-        model_uri=serving.current_model_symlink,
-        port=serving.scorer_port,
-        # get_cmd's own type hint says `host: int | None`, but its body does
-        # `shlex.quote(host)` -- confirmed by reading the source (mlflow==3.15.1)
-        # that this is an upstream stub bug, not a real `int` expectation.
-        host=serving.scorer_host,  # type: ignore[arg-type]
-        timeout=serving.scorer_timeout_s,
-        nworkers=serving.scorer_workers,
-    )
-    child = subprocess.Popen(["bash", "-c", "exec " + command], env=env)
+    child = _spawn(settings)
 
     stop_event = stop_event if stop_event is not None else threading.Event()
-    _install_signal_forwarding(child, stop_event)
+    holder = _ChildHolder(child)
+    _install_signal_forwarding(holder, stop_event)
 
     poller = threading.Thread(
         target=_poll_champion,
-        args=(settings, child, stop_event, on_deployment, ref.version),
+        args=(settings, holder, stop_event, on_deployment, ref.version),
         daemon=True,
         name="champion-poll",
     )
     poller.start()
 
     try:
-        return child.wait()
+        while True:
+            child = holder.current
+            code = child.wait()
+            if stop_event.is_set():
+                return code
+            # A restart terminates the child deliberately. Taking the lock here
+            # blocks until any in-flight restart has finished swapping in the
+            # replacement, so "the child exited" can be told apart from "the
+            # child was replaced" without racing the poll thread.
+            with holder.lock:
+                if holder.current is not child:
+                    continue
+            _logger.error("scoring server exited unexpectedly with code %s", code)
+            return code
     finally:
         stop_event.set()
+        _terminate(holder.current)
+
+
+class _ChildHolder:
+    """The live child, swapped under a lock on restart.
+
+    Signal forwarding and the poll thread both need "whichever child is current
+    right now"; without this they would race against a restart and signal a
+    process that has already been replaced. Reentrant because the SIGTERM handler
+    runs on the main thread, which may already hold the lock.
+    """
+
+    def __init__(self, child: subprocess.Popen[bytes]) -> None:
+        self._child = child
+        self.lock = threading.RLock()
+
+    @property
+    def current(self) -> subprocess.Popen[bytes]:
+        with self.lock:
+            return self._child
+
+    def replace(self, child: subprocess.Popen[bytes]) -> None:
+        with self.lock:
+            self._child = child
+
+
+def _spawn(settings: Settings) -> subprocess.Popen[bytes]:
+    serving = settings.serving
+    return subprocess.Popen(
+        [
+            "bentoml",
+            "serve",
+            _SERVICE_IMPORT_PATH,
+            "--host",
+            serving.scorer_host,
+            "--port",
+            str(serving.scorer_port),
+        ]
+    )
 
 
 def _poll_champion(
     settings: Settings,
-    child: subprocess.Popen[bytes],
+    holder: _ChildHolder,
     stop_event: threading.Event,
     on_deployment: Callable[[ModelRef], None] | None,
     initial_version: str,
@@ -130,11 +151,11 @@ def _poll_champion(
     current_version = initial_version
     interval = settings.serving.champion_poll_s
     while not stop_event.wait(interval):
-        if child.poll() is not None:
+        if holder.current.poll() is not None:
             return  # child already exited; nothing left to reload
 
         try:
-            ref = build_and_activate_champion(settings)
+            ref = activate_champion(settings)
         except Exception:
             # A dead/unreachable remote MLflow here delays only the *next*
             # promotion. It must never take down an already-running scorer --
@@ -146,9 +167,9 @@ def _poll_champion(
 
         if ref.version == current_version:
             continue
-        try:
-            child.send_signal(signal.SIGHUP)
-        except ProcessLookupError:
+
+        _logger.info("champion %s -> %s; restarting the server", current_version, ref.version)
+        if not _restart(holder, settings, stop_event):
             return
 
         if _wait_for_served_version(
@@ -158,35 +179,53 @@ def _poll_champion(
             _notify(on_deployment, ref)
         else:
             _logger.warning(
-                "SIGHUP sent for version %s but the server never confirmed "
-                "serving it (uvicorn likely aborted the restart under load, "
-                "keeping the old workers -- see this module's docstring); "
-                "will retry on the next poll tick",
+                "restarted for version %s but the server never confirmed serving "
+                "it; will retry on the next poll tick",
                 ref.version,
             )
 
 
-# A syntactically valid (semantically ignored) row for the op=model_info probe
-# below -- MLflow enforces the input schema before predict() runs regardless of
-# op, so even a pure metadata query needs one (see serving/signature.py).
-_FIELD_TYPES: dict[str, str] = {
-    f.name: f.type  # type: ignore[misc]
-    for f in dataclasses.fields(TransactionEvent)
-}
-_PLACEHOLDER_BY_TYPE: dict[str, object] = {"str": "", "float": 0.0, "int": 0}
-_PROBE_ROW = {name: _PLACEHOLDER_BY_TYPE[_FIELD_TYPES[name]] for name in TXN_FIELD_NAMES}
+def _restart(holder: _ChildHolder, settings: Settings, stop_event: threading.Event) -> bool:
+    """Drain the current child and spawn its replacement. Returns False if the
+    supervisor is shutting down and no replacement should be started.
+
+    Holds the lock across the whole swap so the main loop cannot observe the
+    intermediate state where the old child has exited and the new one does not
+    exist yet.
+    """
+    with holder.lock:
+        _terminate(holder.current)
+        if stop_event.is_set():
+            return False
+        holder.replace(_spawn(settings))
+        return True
+
+
+def _terminate(child: subprocess.Popen[bytes]) -> None:
+    """SIGTERM, then SIGKILL if it will not drain. BentoML shuts down gracefully
+    on SIGTERM, so requests already accepted complete before the process exits."""
+    if child.poll() is not None:
+        return
+    with suppress(ProcessLookupError):
+        child.terminate()
+    try:
+        child.wait(timeout=_DRAIN_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _logger.warning("child did not drain within %ss; killing it", _DRAIN_TIMEOUT_S)
+        with suppress(ProcessLookupError):
+            child.kill()
+        with suppress(subprocess.TimeoutExpired):
+            child.wait(timeout=10)
 
 
 def _wait_for_served_version(settings: Settings, version: str, *, timeout_s: float) -> bool:
-    """Polls the actually-running scoring server (not this process's own state)
-    for the model_version it reports, via a real op=model_info request -- the
-    only way to observe whether restart_all() actually switched over, since
-    uvicorn gives this process no other signal. Best-effort: any error (server
-    mid-restart, connection refused) is treated as "not yet", never raised."""
-    url = f"http://127.0.0.1:{settings.serving.scorer_port}/invocations"
-    body = json.dumps({"dataframe_records": [_PROBE_ROW], "params": {"op": "model_info"}}).encode(
-        "utf-8"
-    )
+    """Polls the actually-running server (not this process's own state) for the
+    model version it reports, via a real ``/model_info`` request -- the only way
+    to observe that the replacement booted and loaded the new champion, rather
+    than crash-looping. Best-effort: any error (server still booting, connection
+    refused) is treated as "not yet", never raised."""
+    url = f"http://127.0.0.1:{settings.serving.scorer_port}/model_info"
+    body = b"{}"
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
@@ -195,7 +234,7 @@ def _wait_for_served_version(settings: Settings, version: str, *, timeout_s: flo
             )
             with urllib.request.urlopen(request, timeout=2) as resp:
                 payload = json.loads(resp.read())
-            if payload["predictions"][0]["version"] == version:
+            if payload["version"] == version:
                 return True
         except Exception:
             pass
@@ -203,11 +242,11 @@ def _wait_for_served_version(settings: Settings, version: str, *, timeout_s: flo
     return False
 
 
-def _install_signal_forwarding(child: subprocess.Popen[bytes], stop_event: threading.Event) -> None:
+def _install_signal_forwarding(holder: _ChildHolder, stop_event: threading.Event) -> None:
     def _forward(signum: int, _frame: object) -> None:
         stop_event.set()
         with suppress(ProcessLookupError):
-            child.send_signal(signum)
+            holder.current.send_signal(signum)
 
     signal.signal(signal.SIGTERM, _forward)
     signal.signal(signal.SIGINT, _forward)

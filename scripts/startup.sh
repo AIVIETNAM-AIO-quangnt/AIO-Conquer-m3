@@ -152,7 +152,7 @@ echo "Airflow UI:  http://localhost:8080  (user/pass from _AIRFLOW_WWW_USER_* in
 echo "otel-collector health: http://localhost:13133"
 if [ -n "$mlflow_uri" ]; then
   scorer_port="$(grep -E '^C3_SCORER_PORT=' .env | cut -d= -f2- || true)"
-  echo "scorer:      http://localhost:${scorer_port:-3000}/ping"
+  echo "scorer:      http://localhost:${scorer_port:-3000}/docs.json (Swagger UI at /)"
 fi
 echo
 echo "Next: scripts/smoke/layer1_infra.sh (and the rest of scripts/smoke/) to verify"

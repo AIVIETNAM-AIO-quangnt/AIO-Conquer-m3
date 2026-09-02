@@ -1,17 +1,19 @@
-# The scorer: MLflow's own scoring server (mlflow.pyfunc.scoring_server, i.e.
-# FastAPI + uvicorn), vendored as a library and launched by our own supervisor
-# (`conquer3 serve`, src/conquer3/serving/supervisor.py) -- not `mlflow models
-# serve`, and not a proxy/gateway to the remote MLflow. This container IS the
-# inference endpoint: it pulls the champion artifact out of remote MLflow once at
-# boot, then serves entirely from local files, local Redis, and local CPU. See
-# README's Layer 5 section and the architecture plan's §8 for the full boundary.
+# The scorer: a BentoML service (src/conquer3/serving/service.py) supervised by
+# `conquer3 serve` (src/conquer3/serving/supervisor.py). This container IS the
+# inference endpoint, not a proxy/gateway to the remote MLflow: the supervisor
+# pulls the champion artifact out of remote MLflow at boot, pins the version in a
+# pointer file, and the workers serve entirely from local files, local Redis, and
+# local CPU -- a worker process never contacts MLflow at all. See README's Layer 5
+# section and the architecture plan's §8 for the full boundary.
+#
+# Routes: POST /predict, POST /model_info, POST /invocations (deprecated MLflow
+# envelope), plus BentoML's /livez, /healthz, /readyz, /metrics, the OpenAPI spec
+# at /docs.json and Swagger UI at /.
 FROM python:3.12-slim
 
-# bash: the supervisor launches uvicorn via `bash -c "exec ..."` so it owns the
-# uvicorn master PID directly (see supervisor.py's module docstring). curl: the
-# container healthcheck (`GET /ping`, one of the scoring server's four fixed
-# routes -- there is no /readyz, that was a BentoML artifact).
-RUN apt-get update && apt-get install -y --no-install-recommends curl bash \
+# curl: the container healthcheck (`GET /readyz`, which returns 500 until the
+# workers have loaded the champion).
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

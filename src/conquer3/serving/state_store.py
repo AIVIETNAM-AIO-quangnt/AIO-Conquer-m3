@@ -29,7 +29,7 @@ class RedisStateStore:
     """Thread-safe by construction: ``redis.Redis`` pools its own connections
     internally and a registered ``Script`` is a stateless callable, so concurrent
     request threads inside one worker process may share a single instance without
-    a lock (see plan §8.4 -- ``FraudScorerModel`` holds no per-request mutable
+    a lock (see plan §8.4 -- ``FraudScorer`` holds no per-request mutable
     state of its own either)."""
 
     def __init__(self, *, redis_settings: RedisSettings, state_settings: StateSettings) -> None:
@@ -58,7 +58,7 @@ class RedisStateStore:
 
     def get(self, account_id: str) -> AccountState | None:
         """Read-only; safe to call even during a dry_run (dry_run only skips the
-        *write* side -- see FraudScorerModel.predict)."""
+        *write* side -- see FraudScorer.score)."""
         raw = self._client.get(redis_state_key(account_id, prefix=self._key_prefix))
         state = state_from_json(raw)
         (self._hit_counter if state is not None else self._miss_counter).add(1)

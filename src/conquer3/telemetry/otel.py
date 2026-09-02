@@ -24,13 +24,12 @@ _initialized = False
 
 def init_telemetry(service_name: str) -> None:
     """Idempotent per process. Call once at process startup, before any span or
-    instrument is used -- in particular, ``serving.pyfunc_model.FraudScorerModel.
-    load_context`` calls this too, not just the ``conquer3 serve`` CLI entrypoint,
-    because uvicorn's scoring-server workers are separate OS processes from the
-    supervisor that resolved and launched them (plan §8.5); without a call inside
-    ``load_context`` itself, the process that actually handles ``/invocations``
-    would never install a real provider and every metric/span recorded there would
-    be silently dropped.
+    instrument is used -- in particular, ``serving.service.FraudScorerService.
+    __init__`` calls this too, not just the ``conquer3 serve`` CLI entrypoint,
+    because BentoML's workers are separate OS processes from the supervisor that
+    resolved and launched them (plan §8.5); without a call inside ``__init__``
+    itself, the process that actually handles ``/predict`` would never install a
+    real provider and every metric/span recorded there would be silently dropped.
 
     Wires all three OTel signals to the same collector endpoint: traces, metrics (a
     MeterProvider -- without this, ``get_meter(...).create_counter(...)`` calls

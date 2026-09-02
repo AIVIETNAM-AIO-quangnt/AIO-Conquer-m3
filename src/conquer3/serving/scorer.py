@@ -1,79 +1,76 @@
-"""The custom pyfunc model served by MLflow's own scoring server.
+"""Everything Layer 5 actually *does*, with no web framework in sight.
 
-The stock scoring server is stateless; everything Layer 5 actually *does* lives in
-this one class. ``load_context`` runs once per uvicorn worker **process** (a fresh
-Python interpreter for each of ``--workers N``), never per request. It loads the
-champion via ``mlflow.sklearn.load_model`` -- the flavor-specific loader, not
-``mlflow.pyfunc.load_model`` -- so ``self._pipe`` is the raw sklearn estimator with
-a real ``predict_proba``, not a pyfunc wrapper whose ``.predict()`` would return
-class labels instead of a score.
+This class knows nothing about BentoML, HTTP, or MLflow's serving stack: it takes
+already-validated :class:`TransactionEvent`s and returns :class:`ScoreResult`s.
+``serving/service.py`` owns the transport, ``serving/champion.py`` owns model
+resolution, and this owns the fold. Keeping the boundary there is what lets
+``scripts/smoke/_layer7_emit_spans.py`` exercise the real instrumentation with
+fake collaborators and no infrastructure at all.
 
-**Thread-safety.** ``/invocations`` is ``async def`` but dispatches through
-``await asyncio.to_thread(...)``, so concurrent requests run ``predict`` on
-parallel threads inside this one process, on top of parallel *processes* across
-``--workers N`` (plan §8.4). This class holds no per-request mutable instance
-state: every request builds its own ``TransactionEvent``/``AccountState``/
-``FeatureVector`` locally. Same-account races are handled downstream by
-``RedisStateStore``'s monotonic CAS, not by locking here.
+It loads nothing itself -- the champion pipeline and its :class:`ModelRef` are
+constructor arguments. ``pipe`` must be the raw sklearn estimator (loaded with
+``mlflow.sklearn.load_model``, never ``mlflow.pyfunc.load_model``) so it has a
+real ``predict_proba``; a pyfunc wrapper's ``.predict()`` would return class
+labels instead of a score.
+
+**Thread-safety.** BentoML dispatches concurrent requests onto threads within one
+worker process, on top of parallel *processes* across ``workers=N``. This class
+holds no per-request mutable instance state: every request builds its own
+``TransactionEvent``/``AccountState``/``FeatureVector`` locally. Same-account
+races are handled downstream by ``RedisStateStore``'s monotonic CAS, not by
+locking here.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import time
-from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
-import mlflow.sklearn
 import pandas as pd
-from mlflow.pyfunc.model import PythonModel, PythonModelContext
 
-from conquer3.config.settings import get_settings
 from conquer3.contracts.events import ScoredEvent
 from conquer3.contracts.model_registry import ModelRef
 from conquer3.core.features import compute
 from conquer3.core.schema import FEATURE_SCHEMA_VERSION
 from conquer3.core.types import FeatureVector, TransactionEvent
+from conquer3.serving.api_models import ScoreResult
 from conquer3.serving.event_sink import JsonlEventSink
-from conquer3.serving.signature import TXN_FIELD_NAMES
 from conquer3.serving.state_store import RedisStateStore
-from conquer3.telemetry.otel import get_meter, get_tracer, init_telemetry
+from conquer3.telemetry.otel import get_meter, get_tracer
 
-__all__ = ["FraudScorerModel"]
-
-# TransactionEvent uses `from __future__ import annotations` (string annotations),
-# same assumption serving/signature.py and pipelines/pathway/schemas.py make.
-_TXN_FIELD_CASTS: dict[str, type] = {
-    f.name: {"str": str, "float": float, "int": int}[f.type]  # type: ignore[index]
-    for f in dataclasses.fields(TransactionEvent)
-}
+__all__ = ["FraudScorer"]
 
 
-class FraudScorerModel(PythonModel):
-    _KNOWN_OPS: ClassVar[frozenset[str]] = frozenset({"score", "model_info"})
-
-    def load_context(self, context: PythonModelContext) -> None:
-        # uvicorn workers are separate OS processes from the supervisor that
-        # already called init_telemetry() in cli.py's _cmd_serve -- this is the
-        # one that actually needs to run in the process serving /invocations.
-        init_telemetry("conquer3-scorer")
-        self._pipe = mlflow.sklearn.load_model(context.artifacts["champion"])
-        self._ref = ModelRef(
-            **json.loads(Path(context.artifacts["ref"]).read_text(encoding="utf-8"))
-        )
-        settings = get_settings()
-        self._threshold = settings.serving.decision_threshold
-        self._state = RedisStateStore(redis_settings=settings.redis, state_settings=settings.state)
-        self._sink = JsonlEventSink(event_settings=settings.event)
+class FraudScorer:
+    def __init__(
+        self,
+        *,
+        pipe: Any,
+        ref: ModelRef,
+        threshold: float,
+        state: RedisStateStore,
+        sink: JsonlEventSink,
+    ) -> None:
+        self._pipe = pipe
+        self._ref = ref
+        self._threshold = threshold
+        self._state = state
+        self._sink = sink
         self._init_instruments()
+
+    @property
+    def ref(self) -> ModelRef:
+        """The champion this scorer is serving."""
+        return self._ref
 
     def _init_instruments(self) -> None:
         """Tracer + the scorer's share of plan §10's "Custom instruments" list.
 
-        Split out from load_context so tests can call it directly without a real
-        MLflow artifact/Redis/event dir (see tests/unit/test_pyfunc_model.py) --
-        get_tracer/get_meter are safe no-ops whether or not init_telemetry has run.
+        Split out from ``__init__`` so tests and ``scripts/smoke/_layer7_emit_spans.py``
+        can call it directly on a hand-assembled instance without a real model,
+        Redis, or event dir -- get_tracer/get_meter are safe no-ops whether or not
+        init_telemetry has run.
         """
         self._tracer = get_tracer(__name__)
         meter = get_meter(__name__)
@@ -92,28 +89,7 @@ class FraudScorerModel(PythonModel):
             "c3_feature_null_total", description="Null feature values, by feature name"
         )
 
-    def predict(
-        self,
-        context: PythonModelContext,
-        model_input: pd.DataFrame,
-        params: dict[str, Any] | None = None,
-    ) -> pd.DataFrame:
-        params = params or {}
-        op = params.get("op", "score")
-        if op not in self._KNOWN_OPS:
-            raise ValueError(f"unknown op {op!r}; expected one of {sorted(self._KNOWN_OPS)}")
-        if op == "model_info":
-            return pd.DataFrame([dataclasses.asdict(self._ref)])
-        return self._score(model_input, dry_run=bool(params.get("dry_run", False)))
-
-    def _score(self, model_input: pd.DataFrame, *, dry_run: bool) -> pd.DataFrame:
-        txns = [
-            TransactionEvent(
-                **{name: _TXN_FIELD_CASTS[name](row[name]) for name in TXN_FIELD_NAMES}
-            )
-            for row in model_input.to_dict(orient="records")
-        ]
-
+    def score(self, txns: list[TransactionEvent], *, dry_run: bool = False) -> list[ScoreResult]:
         # Group by account_id, fold in event_ts_us order -- back-to-back
         # transactions for the same account in one payload must see each other's
         # state (plan §8.4). Across accounts this parallelizes safely; within one
@@ -122,7 +98,7 @@ class FraudScorerModel(PythonModel):
         for i, txn in enumerate(txns):
             by_account.setdefault(txn.account_id, []).append(i)
 
-        responses: list[dict[str, Any] | None] = [None] * len(txns)
+        responses: list[ScoreResult | None] = [None] * len(txns)
         with self._tracer.start_as_current_span(
             "score_batch", attributes={"dry_run": dry_run, "row_count": len(txns)}
         ):
@@ -170,20 +146,23 @@ class FraudScorerModel(PythonModel):
                                 )
                             )
 
-                    responses[i] = {
-                        "event_id": txn.event_id,
-                        "fraud_score": proba,
-                        "decision": decision,
-                        "had_prev_state": had_prev_state,
-                        "seconds_since_last_txn": features.values["seconds_since_last_txn"],
-                        "model_version": self._ref.version,
-                        "feature_schema_version": FEATURE_SCHEMA_VERSION,
-                        "degraded": self._ref.degraded,
-                    }
+                    seconds_since = features.values["seconds_since_last_txn"]
+                    responses[i] = ScoreResult(
+                        event_id=txn.event_id,
+                        fraud_score=proba,
+                        decision=decision,
+                        had_prev_state=had_prev_state,
+                        seconds_since_last_txn=(
+                            None if seconds_since is None else float(seconds_since)
+                        ),
+                        model_version=self._ref.version,
+                        feature_schema_version=FEATURE_SCHEMA_VERSION,
+                        degraded=self._ref.degraded,
+                    )
                     prev = new_state
 
         assert all(r is not None for r in responses)
-        return pd.DataFrame(responses)
+        return [r for r in responses if r is not None]
 
     def _predict_proba(self, features: FeatureVector) -> float:
         row = pd.DataFrame([features.model_inputs()])

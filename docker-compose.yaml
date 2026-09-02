@@ -321,8 +321,7 @@ services:
       REDIS_HOST: redis
       C3_MODEL_CACHE_DIR: /models
       C3_MODEL_CHAMPION_CACHE_FILE: /models/champion.json
-      C3_WRAPPED_MODEL_DIR: /models/wrapped
-      C3_CURRENT_MODEL_SYMLINK: /models/current
+      C3_ACTIVE_CHAMPION_FILE: /models/active.json
       # OTEL_EXPORTER_OTLP_ENDPOINT: not overridden -- see the same note on the
       # `pathway` service above.
     # Lets MLFLOW_TRACKING_URI=http://host.docker.internal:<port> reach an
@@ -342,16 +341,17 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      # /ping is one of the scoring server's four fixed routes (no /readyz --
-      # that was a BentoML artifact; mlflow's scoring server cannot be extended
-      # with custom routes).
-      test: ["CMD", "curl", "--fail", "http://localhost:3000/ping"]
+      # BentoML's own readiness route: 500 until the workers finish __init__,
+      # which is exactly "the champion is loaded". /livez and /healthz answer
+      # earlier (process is up) and would mark the container healthy too soon.
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/readyz"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
     restart: unless-stopped
-    # conquer3 serve (src/conquer3/serving/supervisor.py) -- Layer 5.
+    # conquer3 serve (src/conquer3/serving/supervisor.py) -- Layer 5:
+    # resolves the champion, then supervises a `bentoml serve` child.
 
   # ──────────────────────────────── demo ────────────────────────────────
   producer:

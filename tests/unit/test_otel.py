@@ -56,7 +56,7 @@ def test_disabled_without_endpoint_leaves_default_noop_providers() -> None:
 
 def test_disabled_get_meter_and_get_tracer_are_still_usable() -> None:
     """The no-op path must never make get_meter/get_tracer unsafe to call --
-    every existing call site (state_store.py, model_registry.py, pyfunc_model.py)
+    every existing call site (state_store.py, model_registry.py, scorer.py)
     calls them unconditionally, with no settings.otel check of its own."""
     script = (
         "from conquer3.telemetry.otel import get_meter, get_tracer, init_telemetry\n"

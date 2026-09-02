@@ -1,6 +1,6 @@
 """Plan §10's "Custom instruments" list actually gets recorded, for the
 instruments the scorer owns: c3_decision_total, c3_fraud_score,
-c3_score_latency_ms, c3_feature_null_total (FraudScorerModel), and
+c3_score_latency_ms, c3_feature_null_total (FraudScorer), and
 c3_event_append_failures_total (JsonlEventSink). c3_state_{hit,miss,cas_rejected}
 and c3_model_resolution_degraded already have their own coverage (state_store.py's
 docstring, tests/integration/test_model_registry_e2e.py).

@@ -53,6 +53,21 @@ def test_append_writes_one_line_to_the_hour_partitioned_path(tmp_path: Path) -> 
     assert lines[0]["event_id"] == "e1"
 
 
+def test_worker_id_separates_two_workers_files_in_the_same_hour(tmp_path: Path) -> None:
+    """BentoML runs `workers=N` as N OS processes. Each gets its own file, and the
+    file name says which worker wrote it -- the layout contracts/events.py
+    documents, and what keeps concurrent appends from ever sharing an fd."""
+    at = 1_704_067_200_000_000
+    for worker_id in (0, 1):
+        sink = JsonlEventSink(event_settings=EventSettings(dir=str(tmp_path)), worker_id=worker_id)
+        sink.append(_event(event_id=f"w{worker_id}", scored_at_us=at))
+        sink.close()
+
+    files = sorted((tmp_path / "scored" / "dt=2024-01-01" / "hr=00").glob("*.jsonl"))
+    assert len(files) == 2
+    assert [f.name.rsplit("-", 1)[-1] for f in files] == ["0.jsonl", "1.jsonl"]
+
+
 def test_multiple_appends_in_the_same_hour_share_one_file(tmp_path: Path) -> None:
     sink = JsonlEventSink(event_settings=EventSettings(dir=str(tmp_path)))
     base = 1_704_067_200_000_000
