@@ -10,14 +10,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import psycopg
+import psycopg2
 
 from conquer3.db.ddl_gen import DDL_DIR
 
 __all__ = ["apply_ddl"]
 
 
-def apply_ddl(conn: psycopg.Connection, *, ddl_dir: Path = DDL_DIR) -> list[str]:
+def apply_ddl(conn: psycopg2.extensions.connection, *, ddl_dir: Path = DDL_DIR) -> list[str]:
     """Runs every ``*.sql`` file in ``ddl_dir``, in filename order.
 
     Returns the filenames applied, in the order they ran.

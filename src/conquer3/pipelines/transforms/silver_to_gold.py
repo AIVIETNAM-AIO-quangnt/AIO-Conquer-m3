@@ -173,7 +173,12 @@ def _flush(cursor: Any, rows: list[dict[str, Any]]) -> int:
     table = pa.Table.from_pylist(rows, schema=_GOLD_SCHEMA)
     cursor.register("_stage_gold", table)
     try:
-        cursor.execute("INSERT INTO pg.gold.txn_features SELECT * FROM _stage_gold")
+        # Explicit target column list, not a bare `SELECT *`: gold.txn_features
+        # carries extra reserved columns beyond _GOLD_SCHEMA (core.schema's
+        # EXTERNAL_MODEL_FEATURES), so a positional INSERT would now mismatch on
+        # column count. Naming exactly _GOLD_SCHEMA's columns leaves the rest NULL.
+        columns = ", ".join(_GOLD_SCHEMA.names)
+        cursor.execute(f"INSERT INTO pg.gold.txn_features ({columns}) SELECT * FROM _stage_gold")
     finally:
         cursor.unregister("_stage_gold")
     return len(rows)

@@ -10,7 +10,7 @@ import threading
 from typing import Any
 
 import pathway as pw
-import psycopg
+import psycopg2
 
 from conquer3.config.settings import PathwaySettings, PgSettings
 
@@ -32,12 +32,13 @@ class PsycopgUpsertObserver(pw.io.python.ConnectorObserver):
 
     Never deletes on retraction. Guarded by a lock: on_change's docstring only
     promises ordering *within* a processing-time batch is unspecified, not that
-    calls are single-threaded, and a bare psycopg.Connection is not safe for
+    calls are single-threaded, and a bare psycopg2 connection is not safe for
     concurrent use from multiple threads.
     """
 
     def __init__(self, *, pg_settings: PgSettings) -> None:
-        self._conn = psycopg.connect(pg_settings.libpq_dsn, autocommit=True)
+        self._conn = psycopg2.connect(pg_settings.libpq_dsn)
+        self._conn.autocommit = True
         self._lock = threading.Lock()
 
     def on_change(self, key: Any, row: dict[str, Any], time: int, is_addition: bool) -> None:
@@ -65,6 +66,8 @@ def write_account_state(
                 "dbname": pg_settings.db,
                 "user": pg_settings.user,
                 "password": pg_settings.password,
+                "sslmode": pg_settings.sslmode,
+                "channel_binding": pg_settings.channel_binding,
             },
             table_name="account_state",
             schema_name="gold",

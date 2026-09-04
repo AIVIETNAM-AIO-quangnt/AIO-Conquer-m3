@@ -1,7 +1,8 @@
 -- GENERATED FILE -- do not hand-edit.
 -- Regenerate with `conquer3 db gen-gold-ddl` after changing core/schema.py's
--- FEATURE_NAMES or pg_column_type(), then bump FEATURE_SCHEMA_VERSION and commit
--- both. tests/unit/test_ddl_gen.py enforces this file stays in sync.
+-- FEATURE_NAMES, pg_column_type(), or EXTERNAL_MODEL_FEATURES, then commit the
+-- result (bump FEATURE_SCHEMA_VERSION too if FEATURE_NAMES changed).
+-- tests/unit/test_ddl_gen.py enforces this file stays in sync.
 --
 -- Feature columns are nullable: conquer3.core.features leaves window features
 -- undefined (NULL) on an account's first transaction -- see COLD_START_NULL_FEATURES
@@ -45,6 +46,71 @@ CREATE TABLE IF NOT EXISTS gold.txn_features (
     txn_type                    text,
     prev_txn_type               text,
     type_pair                   text,
+    --
+    -- Below: reserved for other MLflow-registered models' own feature names (see
+    -- core/schema.py's EXTERNAL_MODEL_FEATURES). conquer3.core.features never
+    -- computes these and the champion scorer never reads them -- always NULL until
+    -- a job backfills that specific model's features.
+    amount_log                  double precision,
+    amount_log10                double precision,
+    amount_log_zscore_by_type_hour double precision,
+    amount_ratio                double precision,
+    amount_to_dest_mean_ratio   double precision,
+    amount_to_orig_mean_ratio   double precision,
+    amount_zscore_by_type_hour  double precision,
+    current_amount              double precision,
+    day_index                   integer,
+    day_of_week                 integer,
+    dest_amount_mean            double precision,
+    dest_amount_mean_hist       double precision,
+    dest_amount_sum_hist        double precision,
+    dest_cashout_freq           integer,
+    dest_count_hist             bigint,
+    dest_freq                   integer,
+    dest_is_frequent            integer,
+    dest_risk_target_enc        double precision,
+    dest_type_count             integer,
+    dest_velocity_1h            integer,
+    dest_velocity_24h           integer,
+    dest_velocity_surge_ratio   double precision,
+    edge_count_hist             bigint,
+    edge_is_new                 integer,
+    f1                          double precision,
+    f2                          double precision,
+    f3                          double precision,
+    hour_cos                    double precision,
+    hour_day                    integer,
+    hour_sin                    double precision,
+    is_capped_10m               integer,
+    is_customer_dest            integer,
+    is_mule_chain               integer,
+    is_night                    integer,
+    is_rapid_passthrough        integer,
+    is_round_10k                integer,
+    is_round_1k                 integer,
+    is_transfer                 integer,
+    is_weekend                  integer,
+    log_amount                  double precision,
+    mule_time_since_transfer    double precision,
+    orig_amount_mean_hist       double precision,
+    orig_amount_sum_hist        double precision,
+    orig_count_hist             bigint,
+    orig_is_first_seen          integer,
+    orig_velocity_1h            integer,
+    orig_velocity_24h           integer,
+    pit_distinct_senders_168h   double precision,
+    pit_distinct_senders_24h    double precision,
+    pit_prior_amount_168h       double precision,
+    pit_prior_amount_1h         double precision,
+    pit_prior_amount_24h        double precision,
+    pit_prior_count_1h          double precision,
+    pit_prior_count_24h         double precision,
+    pit_steps_since_last_event  double precision,
+    step                        bigint,
+    step_day                    integer,
+    transaction_type_transfer   double precision,
+    type                        text,
+    type_code                   integer,
     is_fraud                   BOOLEAN NOT NULL,
     is_flagged_fraud           BOOLEAN NOT NULL
 );

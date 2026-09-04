@@ -11,19 +11,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import psycopg
+import psycopg2
 
 __all__ = ["ingest_events_jsonl"]
 
 
-def ingest_events_jsonl(conn: psycopg.Connection) -> int:
+def ingest_events_jsonl(conn: psycopg2.extensions.connection) -> int:
     """Consume JSONL from scored event files and insert into bronze.scored_events.
 
     Offset-based: reads ops.file_ingest_log to find the last consumed position
     and only processes new lines. Never passes the last incomplete line.
 
     Args:
-        conn: psycopg connection (used for bulk inserts)
+        conn: psycopg2 connection (used for bulk inserts)
 
     Returns:
         Number of rows inserted.

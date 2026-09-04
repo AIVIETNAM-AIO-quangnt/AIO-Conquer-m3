@@ -10,7 +10,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-import psycopg
+import psycopg2
 
 from conquer3.contracts.model_registry import ModelRef
 
@@ -33,7 +33,7 @@ class RunHandle:
 
 
 @contextmanager
-def track_run(conn: psycopg.Connection, layer: str) -> Iterator[RunHandle]:
+def track_run(conn: psycopg2.extensions.connection, layer: str) -> Iterator[RunHandle]:
     """Records one ``ops.pipeline_runs`` row for the lifetime of the ``with`` block.
 
     Set ``rows_in``/``rows_out``/``detail`` on the yielded handle before the block
@@ -63,7 +63,9 @@ class PredictionLabel:
     source: str  # 'ui' | 'csv'
 
 
-def upsert_prediction_labels(conn: psycopg.Connection, rows: Sequence[PredictionLabel]) -> None:
+def upsert_prediction_labels(
+    conn: psycopg2.extensions.connection, rows: Sequence[PredictionLabel]
+) -> None:
     """Writes ground-truth labels for the UI's Inspection tab -- ``ops.prediction_labels``
     (``db/ddl/45_ops_labels.sql``). ``event_id`` is the primary key, so re-labeling an
     already-labeled prediction updates it in place rather than erroring.
@@ -80,7 +82,9 @@ def upsert_prediction_labels(conn: psycopg.Connection, rows: Sequence[Prediction
         )
 
 
-def fetch_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str]) -> dict[str, bool]:
+def fetch_prediction_labels(
+    conn: psycopg2.extensions.connection, event_ids: Sequence[str]
+) -> dict[str, bool]:
     """Ground truth for the given ``event_id``s. An id absent from the returned
     mapping is ``unlabeled`` -- that third state is row absence, not a column value
     (``is_fraud`` is ``NOT NULL``), so callers must not default a missing key to
@@ -96,7 +100,9 @@ def fetch_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str]) 
         return dict(cur.fetchall())
 
 
-def delete_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str]) -> None:
+def delete_prediction_labels(
+    conn: psycopg2.extensions.connection, event_ids: Sequence[str]
+) -> None:
     """Moves the given predictions back to ``unlabeled`` by removing their row --
     the Inspection tab's three-state label editor calls this when a row is set back
     to ``unlabeled`` rather than ``fraud``/``legit``."""
@@ -108,7 +114,7 @@ def delete_prediction_labels(conn: psycopg.Connection, event_ids: Sequence[str])
         )
 
 
-def record_model_deployment(conn: psycopg.Connection, ref: ModelRef) -> None:
+def record_model_deployment(conn: psycopg2.extensions.connection, ref: ModelRef) -> None:
     """Audit-trail row for a resolved model version. Not called by anything in
     Layer 4 -- Layer 5's serving boot sequence calls resolve_champion() then this,
     in that order, since contracts.model_registry can never import conquer3.db
@@ -122,7 +128,12 @@ def record_model_deployment(conn: psycopg.Connection, ref: ModelRef) -> None:
 
 
 def _finish(
-    conn: psycopg.Connection, run_id: int, *, status: str, handle: RunHandle, detail: str | None
+    conn: psycopg2.extensions.connection,
+    run_id: int,
+    *,
+    status: str,
+    handle: RunHandle,
+    detail: str | None,
 ) -> None:
     with conn.cursor() as cur:
         cur.execute(
