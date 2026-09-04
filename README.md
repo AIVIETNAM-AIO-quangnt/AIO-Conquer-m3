@@ -31,6 +31,9 @@ pass before the next one starts.
 
 - [`uv`](https://docs.astral.sh/uv/) (Python package/venv manager)
 - Docker + Docker Compose v2 (`docker compose version`)
+- `make` (Linux/macOS/WSL) or PowerShell (Windows) -- the `Makefile`/`make.ps1`
+  pair at the repo root is the supported way to bring services up; see
+  "Orchestrating services" below
 - Python 3.12 (pinned via `.python-version`)
 
 ## Quickstart
@@ -41,20 +44,21 @@ git clone <this repo> && cd conquer3
 # 1. Python env + .env (generates a real Fernet key and JWT secret into .env)
 ./scripts/bootstrap.sh
 
-# 2. The whole docker-compose stack, profile by profile, waiting for each
-#    service to actually report healthy before moving on
-./scripts/startup.sh
+# 2. Every service, group by group, waiting for each to actually report
+#    healthy before moving on -- see "Orchestrating services" below
+make up            # Linux/macOS/WSL
+.\make.ps1 up        # Windows
 
 # 3. Verify everything end-to-end (see "Verifying" below)
 ./scripts/smoke/layer1_infra.sh
 ```
 
-`scripts/startup.sh` brings up `core` → `pipeline` → `stream` in order (each is
-safe to start with nothing else configured); `serving` only if `.env` already
-has a real `MLFLOW_TRACKING_URI` — bringing `scorer` up without one would just
-crash-loop, since it resolves a champion at boot and refuses to guess. Bring it
-up later with `docker compose --profile serving up -d --build` once you have
-one (see "Running the scorer" below). Re-running `startup.sh` is safe --
+`make up` brings up `airflow` -> `stream` -> `core` in order (each is safe to
+start with nothing else configured); `core` (the `scorer` + `ui` services)
+only actually starts if `.env` already has a real `MLFLOW_TRACKING_URI` --
+bringing `scorer` up without one would just crash-loop, since it resolves a
+champion at boot and refuses to guess. Bring it up later with `make core` once
+you have one (see "Running the scorer" below). Re-running `make up` is safe --
 already-healthy services are left alone.
 
 Airflow UI: **http://localhost:8080** — login from `_AIRFLOW_WWW_USER_USERNAME` /
@@ -68,36 +72,51 @@ uv run pytest tests/
 uv run conquer3 version
 ```
 
-## Compose profiles
+## Orchestrating services
 
-Nothing starts unless you pick a profile — there's no default "just run
-`docker compose up`" here, on purpose, since most services aren't built yet.
+Nothing starts unless you pick a group -- there's no default "just run `make
+up`" that unconditionally starts everything, since `core` needs a real
+`MLFLOW_TRACKING_URI` first (see "Quickstart" above).
+`Makefile` (Linux/macOS/WSL) and `make.ps1` (Windows) wrap
+`docker-compose.yaml`'s profiles into three groups, matching how their
+`depends_on` chains actually resolve:
 
-| Profile | Services | Purpose |
-|---|---|---|
-| `core` | `postgres`, `redis` | Needed by everything else |
-| `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, separate from the `postgres` warehouse) |
-| `stream` | `pathway` | Feature engine (Layer 3b — static backfill + streaming state repair) |
-| `serving` | `scorer` | Scoring API (Layer 5 — the inference endpoint; see "Running the scorer" below) |
-| `ui` | `ui` | Streamlit console at http://localhost:8501 (Layer 9 — Inference + Inspection tabs; a client of `scorer`, holds no model) |
-| `demo` | `producer` | Transaction replay driver (`producer/replay.py`, not built yet) |
-| `tools` | `adminer` | Postgres UI at http://localhost:8081 |
+| Group (`make <name>`) | Compose profile(s) | Services | Purpose |
+|---|---|---|---|
+| `core` | `serving`, `ui` | `scorer`, `ui` | Scoring API (Layer 5) + Streamlit console (Layer 9). Bundled together because `ui` depends_on `scorer`, and Compose only resolves a profile-scoped `depends_on` when both profiles are active in the same command |
+| `stream` | `stream` | `pathway` | Feature engine (Layer 3b -- static backfill + streaming state repair) |
+| `airflow` | `pipeline` | `airflow-postgres`, `airflow-{init,apiserver,scheduler,dag-processor,triggerer}` | Orchestration (own metadata DB, unrelated to the warehouse Postgres) |
 
-Combine profiles freely: `docker compose --profile core --profile pipeline up -d`.
-`ui` depends on `scorer` (profile `serving`) and `postgres` (profile `core`), so
-bringing it up alone won't resolve `depends_on` — the same profile-scoping hazard
-`scripts/startup.sh` documents for `pathway`:
+Each group also has `-down`, `-logs`, `-ps`, `-restart`, and `-build` variants
+(e.g. `make core-logs`, `make airflow-build`), plus combined `make up` /
+`down` / `ps` / `logs` / `restart` / `clean` / `build` across all three -- run
+`make help` (or `.\make.ps1 help`) for the full list. `logs` (and its
+per-group variants) takes `SERVICE=<name>` (`-Service <name>` on Windows) to
+scope to one service, e.g. `make logs SERVICE=scorer`.
+
+Postgres and Redis are **external, managed services** (Neon Postgres, a
+managed Redis) -- there's no local `postgres`/`redis` container in
+`docker-compose.yaml` to bring up; point `POSTGRES_*`/`REDIS_*` in `.env` at
+them instead. (`compose.parity.yaml`, used only by the standalone MLflow demo
+below, is a separate, fully local-native file with its own
+`postgres`/`redis`/`mlflow` containers under its own `core` profile -- don't
+confuse the two.)
+
+`demo` (`producer`, a one-shot transaction replay driver, not built yet) has
+no Makefile group by design -- it's an explicit one-off you run once `scorer`
+is up, not standing infrastructure:
 ```bash
-docker compose --profile core --profile serving --profile ui up -d --build
+docker compose --profile demo up -d --build
 ```
-Streamlit has no auth and no multi-tenant isolation — fine for local/demo use,
-not for exposing this port publicly.
 
-MLflow and Grafana/Prometheus/Loki/Tempo are **remote** — never in this file. Point
-at them via `MLFLOW_TRACKING_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` in `.env` once
-you have addresses — app code talks OTLP straight to the remote stack's own
-collector (no local collector container), which does the fan-out into its
-co-located Prometheus/Tempo/Loki. Verify reachability yourself with
+Streamlit has no auth and no multi-tenant isolation -- fine for local/demo
+use, not for exposing this port publicly.
+
+MLflow and Grafana/Prometheus/Loki/Tempo are **remote** -- never in this file.
+Point at them via `MLFLOW_TRACKING_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` in
+`.env` once you have addresses -- app code talks OTLP straight to the remote
+stack's own collector (no local collector container), which does the fan-out
+into its co-located Prometheus/Tempo/Loki. Verify reachability yourself with
 `scripts/smoke/layer7_observability.sh`.
 
 ## Verifying
@@ -107,8 +126,8 @@ co-located Prometheus/Tempo/Loki. Verify reachability yourself with
 # no containers started. Catches config errors in ~1 second.
 docker compose config --quiet && echo "config OK"
 
-# Full Layer 1 gate: brings up core + pipeline, waits for health, triggers the
-# hello_world DAG, and confirms it actually runs.
+# Full Layer 1 gate: brings up local Postgres/Redis + the airflow pipeline,
+# waits for health, triggers the hello_world DAG, and confirms it actually runs.
 ./scripts/smoke/layer1_infra.sh
 
 # Layer 0 gate: lint, type-check, import boundaries, full test suite, and a
@@ -116,7 +135,8 @@ docker compose config --quiet && echo "config OK"
 ./scripts/smoke/layer0_skeleton.sh
 
 # Layer 2 gate: applies the medallion DDL, then runs ingest -> bronze -> silver ->
-# gold over the real PaySim1 dataset end to end. Needs Layer 1's `core` profile up.
+# gold over the real PaySim1 dataset end to end. Needs a reachable Postgres per
+# .env's POSTGRES_* (managed, e.g. Neon, or a local instance).
 # Fetches the CSV itself if C3_PAYSIM_CSV_PATH (.env) isn't already there --
 # extracts a sibling .zip if one's present, else downloads it (PaySim1 is public,
 # no Kaggle credentials needed).
@@ -178,13 +198,15 @@ served at `/docs.json`, with an interactive Swagger UI at `/` -- open it in a
 browser for a live, always-current description of every route instead of the
 prose below.
 
-**Without Docker** (needs `core` profile's Redis up; a real `MLFLOW_TRACKING_URI`
-in `.env`, or `mlflow server` in a second terminal for a fully local demo --
-`export` it rather than editing `.env`, since a real env var wins over `.env`'s
-value without permanently changing it):
+**Without Docker** (needs `compose.parity.yaml`'s `core` profile's Redis up -- a
+different, local-native `core` from the Makefile's above, see "Orchestrating
+services"; plus a real `MLFLOW_TRACKING_URI` in `.env`, or `mlflow server` in a
+second terminal for a fully local demo -- `export` it rather than editing
+`.env`, since a real env var wins over `.env`'s value without permanently
+changing it):
 
 ```bash
-docker compose --profile core up -d redis                # or: redis-server, if you have it locally
+docker compose -f compose.parity.yaml --profile core up -d redis   # or: redis-server, if you have it locally
 uv run mlflow server --host 127.0.0.1 --port 5000 &       # a throwaway local registry, for a demo
 export MLFLOW_TRACKING_URI=http://127.0.0.1:5000          # overrides .env for this shell only
 
@@ -246,16 +268,17 @@ included `docker/mlflow-standalone/entrypoint.sh` sets `--allowed-hosts "*"`
 for local dev (sufficient for service-name connectivity). Production
 deployments should restrict this to specific hostnames.
 
-**With Docker** (`serving` profile; needs `core` up first, and `MLFLOW_TRACKING_URI`
+**With Docker** (`compose.parity.yaml`'s `serving` profile, which includes this
+`mlflow` service; needs its `core` profile up first, and `MLFLOW_TRACKING_URI`
 in `.env` reachable *from inside the container* -- `localhost` won't resolve to
-your host from in there; `docker-compose.yaml` maps `host.docker.internal` to
+your host from in there; `compose.parity.yaml` maps `host.docker.internal` to
 the host gateway for you (`extra_hosts`), so `http://host.docker.internal:<port>`
 reaches a server on the host on every platform, not just Docker Desktop; a real
 remote address needs no such thing):
 
 ```bash
-docker compose --profile core --profile serving up -d --build
-docker compose ps scorer                                   # healthy once /readyz responds
+docker compose -f compose.parity.yaml --profile core --profile serving up -d --build
+docker compose -f compose.parity.yaml ps scorer             # healthy once /readyz responds
 curl http://localhost:${C3_SCORER_PORT:-3000}/readyz
 ```
 
@@ -344,9 +367,9 @@ Two things confirmed empirically if you point this at a throwaway local
 Ad hoc:
 
 ```bash
-docker compose ps                        # health status
-docker compose logs -f airflow-init       # watch db migrate + admin user creation
-bash scripts/smoke/layer7_observability.sh  # verify the remote LGTM stack itself
+make ps                                       # health status across every group
+make airflow-logs SERVICE=airflow-init        # watch db migrate + admin user creation
+bash scripts/smoke/layer7_observability.sh    # verify the remote LGTM stack itself
 ```
 
 ## Repo layout
@@ -413,8 +436,8 @@ extra:
 |---|---|---|
 | `train` | scikit-learn, pandas, kagglehub, mlflow | Colab notebook (Layer 8) |
 | `serving` | bentoml, mlflow (via `registry`), redis, scikit-learn | `serving/` (Layer 5, done) |
-| `pipeline` | ibis, duckdb, polars, psycopg | `db/`, `pipelines/` (Layer 2) |
-| `stream` | pathway, redis, psycopg | `pipelines/pathway/` (Layer 3b, done) |
+| `pipeline` | ibis, duckdb, polars, psycopg2 | `db/`, `pipelines/` (Layer 2) |
+| `stream` | pathway, redis, psycopg2 | `pipelines/pathway/` (Layer 3b, done) |
 | `registry` | mlflow (full, not `-skinny`) | `contracts/model_registry.py` |
 
 `bentoml` owns the web stack (its own starlette/uvicorn, not pinned here) and,
