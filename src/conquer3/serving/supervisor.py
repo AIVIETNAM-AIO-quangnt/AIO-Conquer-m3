@@ -128,17 +128,21 @@ class _ChildHolder:
 
 def _spawn(settings: Settings) -> subprocess.Popen[bytes]:
     serving = settings.serving
-    return subprocess.Popen(
-        [
-            "bentoml",
-            "serve",
-            _SERVICE_IMPORT_PATH,
-            "--host",
-            serving.scorer_host,
-            "--port",
-            str(serving.scorer_port),
-        ]
-    )
+    args = [
+        "bentoml",
+        "serve",
+        _SERVICE_IMPORT_PATH,
+        "--host",
+        serving.scorer_host,
+        "--port",
+        str(serving.scorer_port),
+    ]
+    if serving.scorer_reload:
+        # Development only: watches source files (via watchfiles) and restarts
+        # the child on change -- effective once docker-compose.yaml bind-mounts
+        # ./src over the image's installed copy, so host edits are what it sees.
+        args.append("--reload")
+    return subprocess.Popen(args)
 
 
 def _poll_champion(

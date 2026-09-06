@@ -19,6 +19,13 @@
 # soon as containers are merely started -- the same guarantee
 # scripts/startup.sh's hand-rolled polling gives, without duplicating it.
 #
+# `up` never passes `--build`: Compose still builds an image the first time it's
+# missing, but on every later `up` it reuses whatever image already exists,
+# even if the Dockerfile or build context changed since -- rebuilding only
+# happens when explicitly requested via `make build` (or `core-build`/
+# `stream-build`/`airflow-build`). This keeps `up` fast and side-effect-free for
+# the common case of just restarting or joining already-running services.
+#
 # Usage: make help
 
 SHELL := /bin/bash
@@ -46,7 +53,8 @@ SERVICE ?=
         core core-up core-down core-logs core-ps core-restart core-build \
         stream stream-up stream-down stream-logs stream-ps stream-restart stream-build \
         airflow airflow-up airflow-down airflow-logs airflow-ps airflow-restart airflow-build \
-        up down ps logs restart clean build
+        up down ps logs restart clean build \
+        db-migrate ingest-download ingest-bronze transform pathway-backfill pathway-streaming pipeline
 
 help:
 	@echo "conquer3 docker-compose orchestration"
@@ -55,7 +63,8 @@ help:
 	@echo "  make stream           up streaming: pathway"
 	@echo "  make airflow          up airflow: postgres, init, apiserver, scheduler,"
 	@echo "                        dag-processor, triggerer"
-	@echo "  make up               bring up all three groups"
+	@echo "  make up               bring up all three groups (never rebuilds images --"
+	@echo "                        see 'make build' below)"
 	@echo "  make down             tear down every profile"
 	@echo "  make ps               show status across every profile"
 	@echo "  make logs [SERVICE=x] follow logs (all profiles, optionally scoped)"
@@ -75,6 +84,16 @@ help:
 	@echo
 	@echo "  Per-group variants (swap the prefix): core-down, core-logs, core-ps,"
 	@echo "  core-restart, core-build, stream-down, ..., airflow-down, ..."
+	@echo
+	@echo "  conquer3 CLI (host-side, no Docker -- see README.md's 'conquer3 CLI"
+	@echo "  reference' for the full command surface):"
+	@echo "  make db-migrate          apply db/ddl/*.sql idempotently"
+	@echo "  make ingest-download     download the PaySim1 CSV from Kaggle"
+	@echo "  make ingest-bronze       load the CSV into bronze.txn_raw"
+	@echo "  make transform           bronze-to-silver -> silver-to-gold -> export-staging"
+	@echo "  make pathway-backfill    static-mode: fold staging into account state"
+	@echo "  make pathway-streaming   streaming-mode: continuously repair account state"
+	@echo "  make pipeline            db-migrate + ingest-bronze + transform, in order"
 
 check-env:
 	@test -f .env || { echo "FAIL: .env not found. Run scripts/bootstrap.sh first." >&2; exit 1; }
@@ -90,7 +109,7 @@ core-up: check-env
 		echo "  (and register+alias a champion), then re-run 'make core'."
 		exit 0
 	fi
-	COMPOSE_PROFILES=$(CORE_PROFILES) $(COMPOSE) up -d --force-recreate --wait --wait-timeout $(CORE_WAIT_TIMEOUT)
+	COMPOSE_PROFILES=$(CORE_PROFILES) $(COMPOSE) up -d --wait --wait-timeout $(CORE_WAIT_TIMEOUT)
 
 core-down: check-env
 	COMPOSE_PROFILES=$(CORE_PROFILES) $(COMPOSE) down
@@ -111,7 +130,7 @@ core-build: check-env
 stream: stream-up
 
 stream-up: check-env
-	COMPOSE_PROFILES=$(STREAM_PROFILES) $(COMPOSE) up -d --build --wait --wait-timeout $(STREAM_WAIT_TIMEOUT)
+	COMPOSE_PROFILES=$(STREAM_PROFILES) $(COMPOSE) up -d --wait --wait-timeout $(STREAM_WAIT_TIMEOUT)
 
 stream-down: check-env
 	COMPOSE_PROFILES=$(STREAM_PROFILES) $(COMPOSE) down
@@ -132,7 +151,7 @@ stream-build: check-env
 airflow: airflow-up
 
 airflow-up: check-env
-	COMPOSE_PROFILES=$(AIRFLOW_PROFILES) $(COMPOSE) up -d --build --wait --wait-timeout $(AIRFLOW_WAIT_TIMEOUT)
+	COMPOSE_PROFILES=$(AIRFLOW_PROFILES) $(COMPOSE) up -d --wait --wait-timeout $(AIRFLOW_WAIT_TIMEOUT)
 
 airflow-down: check-env
 	COMPOSE_PROFILES=$(AIRFLOW_PROFILES) $(COMPOSE) down
@@ -179,3 +198,43 @@ restart: check-env
 
 clean: check-env
 	COMPOSE_PROFILES=$(ALL_PROFILES) $(COMPOSE) down -v
+
+# ────────────────────────── conquer3 CLI (host-side, no Docker) ──────────────────────────
+# Unlike every target above, these run `conquer3` directly via `uv run` instead of a
+# container -- see README.md's "conquer3 CLI reference". `set -a; source .env; set +a`
+# is required here (the Docker targets above don't need it -- Compose injects `.env`
+# as real container env vars itself): conquer3's nested settings classes only read real
+# process env vars, and only the top-level Settings declares env_file=".env", which
+# doesn't cascade into nested BaseSettings built via default_factory.
+db-migrate: check-env
+	set -a; source .env; set +a
+	uv run conquer3 db migrate
+
+ingest-download: check-env
+	set -a; source .env; set +a
+	uv run conquer3 ingest download
+
+ingest-bronze: check-env
+	set -a; source .env; set +a
+	uv run conquer3 ingest bronze
+
+transform: check-env
+	set -a; source .env; set +a
+	uv run conquer3 transform bronze-to-silver
+	uv run conquer3 transform silver-to-gold
+	uv run conquer3 transform export-staging
+
+pathway-backfill: check-env
+	set -a; source .env; set +a
+	uv run conquer3 pathway backfill
+
+pathway-streaming: check-env
+	set -a; source .env; set +a
+	uv run conquer3 pathway streaming
+
+# migrate is cheap and idempotent, so it's included here rather than left as a
+# separate manual step -- matches scripts/smoke/layer2_warehouse.sh's sequence, minus
+# the DQ/consistency checks that script adds around it. `pathway-backfill` is kept out
+# (mirrors dag_medallion_batch/dag_feature_backfill's own separation): it needs Redis
+# reachable too, not just Postgres+DuckDB, and is its own retriggerable stage.
+pipeline: db-migrate ingest-bronze transform

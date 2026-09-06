@@ -12,7 +12,14 @@ from typing import Any
 
 import httpx
 
-__all__ = ["ScorerError", "get_model_info", "is_scorer_healthy", "score_transactions"]
+__all__ = [
+    "ScorerError",
+    "get_model_info",
+    "is_scorer_healthy",
+    "list_loaded_models",
+    "score_transactions",
+    "switch_model",
+]
 
 
 class ScorerError(RuntimeError):
@@ -25,7 +32,7 @@ def score_transactions(
     base_url: str,
     dry_run: bool = False,
     batch_size: int = 500,
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
 ) -> list[dict[str, Any]]:
     """POSTs ``transactions`` to ``{base_url}/predict`` in batches of
     ``batch_size``, returning one ``ScoreResult``-shaped dict per input row, in
@@ -47,6 +54,38 @@ def get_model_info(*, base_url: str, timeout_s: float = 10.0) -> dict[str, Any]:
     """The champion currently served, from ``POST /model_info``."""
     url = base_url.rstrip("/") + "/model_info"
     resp = httpx.post(url, json={}, timeout=timeout_s)
+    if resp.status_code != 200:
+        raise ScorerError(f"POST {url} failed with {resp.status_code}: {resp.text[:500]}")
+    result: dict[str, Any] = resp.json()
+    return result
+
+
+def list_loaded_models(*, base_url: str, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+    """Every version the worker answering this request pre-loaded at startup,
+    from ``POST /models`` -- what ``switch_model`` below can actually pick
+    between, as opposed to every version registered in MLflow (which may
+    include ones this worker excluded as incompatible or a dummy)."""
+    url = base_url.rstrip("/") + "/models"
+    resp = httpx.post(url, json={}, timeout=timeout_s)
+    if resp.status_code != 200:
+        raise ScorerError(f"POST {url} failed with {resp.status_code}: {resp.text[:500]}")
+    result: list[dict[str, Any]] = resp.json()
+    return result
+
+
+def switch_model(
+    *, base_url: str, name: str, version: str, timeout_s: float = 30.0
+) -> dict[str, Any]:
+    """Activates ``(name, version)`` on the scorer worker that answers this
+    request, via ``POST /switch_model`` -- immediate, in-memory, no MLflow
+    round-trip. Not limited to the worker's own configured default model:
+    the pool spans every registered model, so this can switch to an entirely
+    different model family too. Manual and per-worker: with more than one
+    scorer worker, this affects only whichever one happens to answer this
+    HTTP call, not the whole service.
+    """
+    url = base_url.rstrip("/") + "/switch_model"
+    resp = httpx.post(url, json={"name": name, "version": version}, timeout=timeout_s)
     if resp.status_code != 200:
         raise ScorerError(f"POST {url} failed with {resp.status_code}: {resp.text[:500]}")
     result: dict[str, Any] = resp.json()

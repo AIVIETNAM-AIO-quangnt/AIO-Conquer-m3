@@ -8,7 +8,11 @@ requires-python = ">=3.12"
 # INTENTIONALLY EMPTY, FOREVER.
 # `conquer3.core` must be importable with a bare `pip install .` so that Colab can
 # install it without dragging in duckdb/pathway/bentoml. See tests/contract/.
-dependencies = []
+dependencies = [
+    "lightgbm>=4.7.0",
+    "psycopg2>=2.9.12",
+    "xgboost>=3.4.1",
+]
 
 [project.optional-dependencies]
 # Extras, not [dependency-groups]: PEP 735 groups are NOT installable by pip from a
@@ -51,6 +55,7 @@ serving = [
   "joblib>=1.4",
   "pydantic>=2.8",
   "pydantic-settings>=2.4",
+  "pyyaml>=6.0",
 ]
 pipeline = [
   "conquer3[otel]",
@@ -58,16 +63,18 @@ pipeline = [
   "ibis-framework[duckdb,postgres]>=9.5",
   "duckdb>=1.1",
   "polars>=1.9",
-  "psycopg[binary,pool]>=3.2",
+  "psycopg2-binary>=2.9.12",
   "pyarrow>=17",
   "pydantic-settings>=2.4",
+  "pyyaml>=6.0",
 ]
 stream = [
   "conquer3[otel]",
   "pathway>=0.16",
   "redis>=5.0",
-  "psycopg[binary]>=3.2",
+  "psycopg2-binary>=2.9.12",
   "pydantic-settings>=2.4",
+  "pyyaml>=6.0",
 ]
 producer = [
   "conquer3[otel]",
@@ -86,8 +93,9 @@ ui = [
   "conquer3[producer,registry]",
   "streamlit>=1.40",
   "scikit-learn>=1.5,<1.8",   # precision / recall / fbeta / PR / ROC
-  "psycopg[binary]>=3.2",     # ops.prediction_labels
+  "psycopg2-binary>=2.9.12",  # ops.prediction_labels
   "pydantic-settings>=2.4",
+  "pyyaml>=6.0",
 ]
 
 [dependency-groups]
@@ -123,7 +131,7 @@ source_modules = ["conquer3.core"]
 forbidden_modules = [
   "numpy", "pandas", "polars", "pyarrow", "pydantic", "pydantic_settings",
   "redis", "duckdb", "ibis", "pathway", "mlflow", "sklearn",
-  "joblib", "psycopg", "opentelemetry",
+  "joblib", "psycopg", "psycopg2", "opentelemetry",
   "conquer3.config", "conquer3.db", "conquer3.serving",
   "conquer3.pipelines", "conquer3.contracts", "conquer3.telemetry",
   "conquer3.redis_scripts", "conquer3.ui",
@@ -202,11 +210,12 @@ python_version = "3.12"
 strict = true
 packages = ["conquer3"]
 mypy_path = "src"
+plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 module = [
   "kagglehub.*", "pathway.*", "ibis.*", "duckdb.*", "mlflow.*",
-  "pandas.*", "sklearn.*", "streamlit.*",
+  "pandas.*", "sklearn.*", "streamlit.*", "psycopg2.*", "yaml.*",
 ]
 ignore_missing_imports = true
 
@@ -226,6 +235,7 @@ markers = [
   "integration: needs docker-compose services running",
   "pathway: spawns a real pw.run() in its own subprocess; slow, one-shot per process",
   "mlflow: spawns a real local mlflow server subprocess; no Docker needed",
+  "eval: benchmarks a live scorer + real MLflow registry over HTTP (latency/label/score comparison, not a correctness gate); skips cleanly if no live scorer is reachable",
 ]
 
 [tool.coverage.run]

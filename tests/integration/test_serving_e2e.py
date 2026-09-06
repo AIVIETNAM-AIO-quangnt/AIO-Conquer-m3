@@ -30,13 +30,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 pytest.importorskip("testcontainers")
 
 import httpx
 from testcontainers.community.redis import RedisContainer
 
-from conquer3.config.settings import get_settings
+from conquer3.config.settings import _load_yaml_defaults, get_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.mlflow]
 
@@ -91,6 +92,23 @@ def mlflow_and_redis(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
     artifacts.mkdir()
     mlflow_uri = f"http://127.0.0.1:{port}"
 
+    # settings.model.name is yaml-only by design (settings.py's module docstring:
+    # "two config sources, split by kind, never both for the same field" -- a
+    # C3_MODEL_NAME env var is deliberately inert for it). The real override
+    # mechanism is C3_CONFIG_PATH, pointed at a private copy of the real yaml
+    # with just this test's model name swapped in, so every other yaml-sourced
+    # setting (champion_poll_s, decision_threshold, ...) still matches production.
+    real_config = yaml.safe_load(Path("configs/default.yaml").read_text())
+    real_config.setdefault("model", {})["name"] = "gate_scorer_model"
+    # Cleared, not inherited: whatever version the real config happens to be
+    # pinned to (a developer's own local deployment) means nothing in this
+    # fresh ephemeral registry, which only ever has whatever a given test
+    # itself just published -- inheriting a stale pin here previously broke
+    # every test that doesn't also set its own model.version.
+    real_config["model"]["version"] = ""
+    config_path = tmp_path / "test_config.yaml"
+    config_path.write_text(yaml.dump(real_config))
+
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -117,24 +135,27 @@ def mlflow_and_redis(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterato
 
             env = {
                 "MLFLOW_TRACKING_URI": mlflow_uri,
-                "C3_MODEL_NAME": "gate_scorer_model",
+                "C3_CONFIG_PATH": str(config_path),
                 "C3_MODEL_CACHE_DIR": str(tmp_path / "modelcache"),
                 "C3_MODEL_CHAMPION_CACHE_FILE": str(tmp_path / "champion.json"),
                 "C3_ACTIVE_CHAMPION_FILE": str(tmp_path / "active.json"),
                 "REDIS_HOST": redis_c.get_container_host_ip(),
                 "REDIS_PORT": str(redis_c.get_exposed_port(6379)),
                 "C3_EVENT_DIR": str(tmp_path / "events"),
-                # Long by default -- only the reload test shortens it, so other
-                # tests never race a background poll they don't care about.
+                # Long by default -- only the reload test shortens it (both this
+                # and C3_CONFIG_PATH's copied `serving.champion_poll_s` default),
+                # so other tests never race a background poll they don't care about.
                 "C3_CHAMPION_POLL_S": "3600",
             }
             for key, value in env.items():
                 monkeypatch.setenv(key, value)
             get_settings.cache_clear()
+            _load_yaml_defaults.cache_clear()
             try:
                 yield MlflowAndRedis(env=env, _mlflow_proc=proc)
             finally:
                 get_settings.cache_clear()
+                _load_yaml_defaults.cache_clear()
     finally:
         # kill_mlflow() may have already terminated + reaped this process --
         # terminate()/wait() on an already-exited Popen is a documented no-op.
@@ -169,6 +190,57 @@ def _publish_dummy(*, model_name: str, code_sha: str) -> Any:
         decision_threshold=0.5,
         model_name=model_name,
         alias_as_champion=True,
+    )
+
+
+def _publish_real(*, model_name: str, code_sha: str, alias_as_champion: bool = False) -> Any:
+    """Like _publish_dummy, but a real (non-DummyClassifier) estimator -- for
+    tests that specifically want to prove behavior against a real classifier
+    rather than a stub. A ColumnTransformer selecting only the numeric
+    features feeds LogisticRegression, which (unlike DummyClassifier) can't
+    fit raw string categorical columns directly -- the model still accepts the
+    full feature-shaped row at predict time, dropping the categorical columns
+    internally.
+    """
+    import numpy as np
+    import pandas as pd
+    import sklearn
+    from sklearn.compose import ColumnTransformer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+
+    from conquer3.contracts.model_registry import publish_model
+    from conquer3.core.schema import CATEGORICAL_FEATURES, FEATURE_NAMES, NUMERIC_FEATURES
+
+    rng = np.random.default_rng(0)
+    n = 20
+    data: dict[str, object] = {name: rng.normal(size=n) for name in NUMERIC_FEATURES}
+    for name in CATEGORICAL_FEATURES:
+        data[name] = rng.choice(["a", "b"], size=n)
+    x_sample = pd.DataFrame(data, columns=list(FEATURE_NAMES))
+    y = rng.integers(0, 2, size=n)
+
+    clf = Pipeline(
+        [
+            (
+                "select_numeric",
+                ColumnTransformer(
+                    [("num", "passthrough", list(NUMERIC_FEATURES))], remainder="drop"
+                ),
+            ),
+            ("logreg", LogisticRegression()),
+        ]
+    ).fit(x_sample, y)
+    proba = clf.predict_proba(x_sample)
+    return publish_model(
+        clf,
+        x_sample,
+        proba,
+        sklearn_version=sklearn.__version__,
+        code_sha=code_sha,
+        decision_threshold=0.5,
+        model_name=model_name,
+        alias_as_champion=alias_as_champion,
     )
 
 
@@ -629,6 +701,211 @@ def test_promotion_reloads_within_one_poll_interval_with_no_error_responses(
         assert r_final.json()[0]["model_version"] == ref2.version
     finally:
         supervisor.stop()
+
+
+def test_worker_hot_reloads_in_place_with_no_restart_and_no_refused_connection(
+    mlflow_and_redis: MlflowAndRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FraudScorerService's own background poll thread, launched with NO
+    supervisor in the picture at all (``_launch_bentoml_directly``, not
+    ``_launch_supervisor``): ``__init__`` resolves the champion live -- no
+    ``activate_champion()`` call, no pointer file, proving startup no longer
+    depends on a supervisor having run first -- and a later promotion is picked
+    up in place. Stronger than
+    ``test_promotion_reloads_within_one_poll_interval_with_no_error_responses``'s
+    guarantee: here there must be zero refused connections too, not just zero
+    error responses, since nothing ever restarts.
+    """
+    ref1 = _publish_dummy(model_name="gate_scorer_model", code_sha="v1")
+    monkeypatch.setenv("C3_CHAMPION_POLL_S", "2")
+
+    server = _launch_bentoml_directly()
+    try:
+        info1 = server.model_info()
+        assert info1.status_code == 200
+        assert info1.json()["version"] == ref1.version
+        assert info1.json()["degraded"] is False
+
+        ref2 = _publish_dummy(model_name="gate_scorer_model", code_sha="v2")
+        assert ref2.version != ref1.version
+
+        deadline = time.monotonic() + 30
+        seen_version = ref1.version
+        while time.monotonic() < deadline and seen_version != ref2.version:
+            r = server.model_info()
+            assert r.status_code == 200, "a hot-reload must never produce a non-2xx response"
+            seen_version = r.json()["version"]
+            if seen_version != ref2.version:
+                time.sleep(0.25)
+
+        assert seen_version == ref2.version, "hot-reload poll never picked up the new version"
+        assert server.proc.poll() is None, "the worker process must never have restarted"
+
+        r_final = server.predict([_txn_record(event_id="post", event_ts_us=1)])
+        assert r_final.status_code == 200
+        assert r_final.json()[0]["model_version"] == ref2.version
+    finally:
+        server.stop()
+
+
+def test_ui_client_observes_hot_reload_with_no_restart(
+    mlflow_and_redis: MlflowAndRedis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """UI/backend alignment check for the champion hot-reload: exercises
+    ``conquer3.ui.scorer_client``'s actual functions -- the same ones
+    ``ui/app.py``'s sidebar (``get_model_info``) and ``ui/inference.py``'s
+    scoring path (``score_transactions``) call -- against a real hot-reloading
+    scorer, over real HTTP, with no mocking of the UI layer at all.
+
+    Guards the property the sidebar's pending-promotion status message now
+    describes: a promotion is picked up within one ``champion_poll_s`` tick
+    with the worker process never restarting, and every request the UI would
+    have made in that window stays 200.
+    """
+    from conquer3.ui.scorer_client import get_model_info, score_transactions
+
+    ref1 = _publish_dummy(model_name="gate_scorer_model", code_sha="v1")
+    monkeypatch.setenv("C3_CHAMPION_POLL_S", "2")
+
+    server = _launch_bentoml_directly()
+    try:
+        base_url = server.url("")
+
+        info1 = get_model_info(base_url=base_url)
+        assert info1["version"] == ref1.version
+        assert info1["degraded"] is False
+
+        results1 = score_transactions(
+            [_txn_record(event_id="pre", event_ts_us=1_700_000_000_000_000)],
+            base_url=base_url,
+            dry_run=True,
+        )
+        assert results1[0]["model_version"] == ref1.version
+
+        ref2 = _publish_dummy(model_name="gate_scorer_model", code_sha="v2")
+        assert ref2.version != ref1.version
+
+        deadline = time.monotonic() + 30
+        seen_version = ref1.version
+        while time.monotonic() < deadline and seen_version != ref2.version:
+            seen_version = get_model_info(base_url=base_url)["version"]
+            if seen_version != ref2.version:
+                time.sleep(0.25)
+        assert seen_version == ref2.version, (
+            "ui.scorer_client.get_model_info never observed the hot-reload -- "
+            "exactly what the sidebar's pending-promotion poll would see"
+        )
+        assert server.proc.poll() is None, "the worker process must never have restarted"
+
+        results2 = score_transactions(
+            [_txn_record(event_id="post", event_ts_us=1_700_000_010_000_000)],
+            base_url=base_url,
+            dry_run=True,
+        )
+        assert results2[0]["model_version"] == ref2.version
+    finally:
+        server.stop()
+
+
+def test_switch_model_activates_a_preloaded_version_and_pauses_auto_reload(
+    mlflow_and_redis: MlflowAndRedis, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """POST /models lists every pre-loaded (real, non-dummy) version; POST
+    /switch_model activates one without any network call and immediately
+    changes what /predict reports; an unknown version is a 404, not a 500;
+    and once switched, a later champion-hot-reload tick must NOT revert the
+    manual choice back to whatever's aliased "champion" -- the pause from
+    decision #3 in the plan.
+
+    Forces a single worker: C3_SCORER_WORKERS has no effect (scorer_workers is
+    yaml-only), and with the real default of 2, /models, /switch_model, and
+    /predict could each land on a different worker process, making this test's
+    single-process assumptions flaky. Same override technique the fixture
+    already uses for model.name -- a private copy of its yaml, one field added.
+    """
+    config = yaml.safe_load(Path(mlflow_and_redis.env["C3_CONFIG_PATH"]).read_text())
+    config.setdefault("serving", {})["scorer_workers"] = 1
+    single_worker_config = tmp_path / "single_worker_config.yaml"
+    single_worker_config.write_text(yaml.dump(config))
+    monkeypatch.setenv("C3_CONFIG_PATH", str(single_worker_config))
+    monkeypatch.setenv("C3_CHAMPION_POLL_S", "2")
+    get_settings.cache_clear()
+    _load_yaml_defaults.cache_clear()
+
+    ref1 = _publish_real(model_name="gate_scorer_model", code_sha="v1", alias_as_champion=True)
+    ref2 = _publish_real(model_name="gate_scorer_model", code_sha="v2")
+    assert ref2.version != ref1.version
+
+    server = _launch_bentoml_directly()
+    try:
+        listed = server.url("")
+        models = httpx.post(f"{listed}/models", json={}, timeout=15)
+        assert models.status_code == 200
+        versions_listed = {m["version"] for m in models.json()}
+        assert {ref1.version, ref2.version} <= versions_listed, models.json()
+        active = next(m for m in models.json() if m["active"])
+        assert active["version"] == ref1.version  # champion alias, the default pick
+
+        switch = httpx.post(f"{listed}/switch_model", json={"version": ref2.version}, timeout=15)
+        assert switch.status_code == 200
+        assert switch.json()["version"] == ref2.version
+
+        r = server.predict([_txn_record(event_id="post-switch", event_ts_us=1)])
+        assert r.status_code == 200
+        assert r.json()[0]["model_version"] == ref2.version
+
+        bad = httpx.post(f"{listed}/switch_model", json={"version": "does-not-exist"}, timeout=15)
+        assert bad.status_code == 404
+
+        # Wait past several poll intervals: the manual pick must still hold --
+        # not silently reverted back to ref1 (still aliased champion).
+        time.sleep(6)
+        r_after_wait = server.predict([_txn_record(event_id="post-wait", event_ts_us=2)])
+        assert r_after_wait.status_code == 200
+        assert r_after_wait.json()[0]["model_version"] == ref2.version
+    finally:
+        server.stop()
+        get_settings.cache_clear()
+        _load_yaml_defaults.cache_clear()
+
+
+def test_supervisor_boots_from_a_pinned_version_with_no_alias_set(
+    mlflow_and_redis: MlflowAndRedis, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Reproduces and proves the fix for the bug found migrating to
+    settings.model.version: activate_champion() used to call resolve_champion
+    (alias-only) unconditionally, so the real `conquer3 serve` supervisor could
+    never boot a model that has no alias at all -- exactly paysim-fraud-lightgbm's
+    actual state. Publishes a real version with alias_as_champion=False (no
+    alias whatsoever), pins settings.model.version to it, and asserts the real
+    supervisor entrypoint (not _launch_bentoml_directly) boots successfully.
+    """
+    ref = _publish_real(model_name="gate_scorer_model", code_sha="v1", alias_as_champion=False)
+
+    config = yaml.safe_load(Path(mlflow_and_redis.env["C3_CONFIG_PATH"]).read_text())
+    config.setdefault("model", {})["version"] = ref.version
+    pinned_config = tmp_path / "pinned_config.yaml"
+    pinned_config.write_text(yaml.dump(config))
+    monkeypatch.setenv("C3_CONFIG_PATH", str(pinned_config))
+    get_settings.cache_clear()
+    _load_yaml_defaults.cache_clear()
+
+    supervisor = _launch_supervisor(
+        mlflow_and_redis.env, extra_env={"C3_CONFIG_PATH": str(pinned_config)}
+    )
+    try:
+        info = supervisor.model_info()
+        assert info.status_code == 200
+        assert info.json()["version"] == ref.version
+        assert info.json()["degraded"] is False
+
+        r = supervisor.predict([_txn_record(event_id="pinned-boot", event_ts_us=1)])
+        assert r.status_code == 200
+        assert r.json()[0]["model_version"] == ref.version
+    finally:
+        supervisor.stop()
+        get_settings.cache_clear()
+        _load_yaml_defaults.cache_clear()
 
 
 def test_supervisor_pins_the_version_workers_load(mlflow_and_redis: MlflowAndRedis) -> None:

@@ -306,7 +306,11 @@ def build_parser() -> argparse.ArgumentParser:
     publish_dummy = model_sub.add_parser(
         "publish-dummy", help="publish a DummyClassifier -- smoke-tests the registry contract"
     )
-    publish_dummy.add_argument("--name", default=None, help="model name (default: C3_MODEL_NAME)")
+    publish_dummy.add_argument(
+        "--name",
+        default=None,
+        help="model name (default: settings.model.name, from configs/default.yaml)",
+    )
     publish_dummy.add_argument(
         "--alias-champion", action="store_true", help='also alias the new version "champion"'
     )
@@ -315,7 +319,9 @@ def build_parser() -> argparse.ArgumentParser:
         "resolve-champion", help='resolve the "champion" alias (live, falling back to cache)'
     )
     resolve_champion.add_argument(
-        "--name", default=None, help="model name (default: C3_MODEL_NAME)"
+        "--name",
+        default=None,
+        help="model name (default: settings.model.name, from configs/default.yaml)",
     )
     resolve_champion.set_defaults(handler=_cmd_model_resolve_champion)
 

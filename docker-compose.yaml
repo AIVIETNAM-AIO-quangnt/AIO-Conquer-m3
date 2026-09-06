@@ -68,9 +68,7 @@ networks:
     name: c3net
 
 volumes:
-  pgdata:
   airflowdb:
-  redisdata:
   events:
   staging:
   modelcache:
@@ -78,54 +76,11 @@ volumes:
   duckdbdata:
 
 services:
-  # ─────────────────────────────── core ───────────────────────────────
-  postgres:
-    image: postgres:17-alpine
-    profiles: [core]
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-conquer3}
-      POSTGRES_USER: ${POSTGRES_USER:-conquer3}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-      # Layer 2's medallion DDL. Only runs on a fresh volume -- an already-initialized
-      # volume needs `conquer3 db migrate` instead (see db/bootstrap.py).
-      - ./src/conquer3/db/ddl:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conquer3} -d ${POSTGRES_DB:-conquer3}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 5s
-    networks: [c3net]
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    profiles: [core]
-    # noeviction, not allkeys-lru: evicting an account's state key under memory
-    # pressure silently turns a returning customer into a cold start with no error
-    # anywhere. Growth is capped by C3_STATE_TTL_DAYS instead -- see state_store.py
-    # (Layer 5) -- and a miss-ratio alert, not by letting Redis evict at random.
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
-    ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redisdata:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-    networks: [c3net]
-    restart: unless-stopped
-
   # ────────────────────────────── pipeline ──────────────────────────────
-  # Airflow's OWN metadata store -- separate from the `postgres` warehouse above by
-  # design, so Airflow's internal state can never collide with medallion data.
+  # Airflow's OWN metadata store -- unrelated to the warehouse Postgres (Neon) or
+  # the account-state Redis (managed) that `pathway`/`scorer`/`ui` talk to below,
+  # both external now. This file has no local `postgres`/`redis` service at all --
+  # see compose.parity.yaml for the local-native stack that still does.
   airflow-postgres:
     image: postgres:17-alpine
     profiles: [pipeline]
@@ -270,28 +225,16 @@ services:
     profiles: [stream]
     env_file:
       - .env
-    # .env's own values are host-friendly (POSTGRES_HOST=localhost,
-    # REDIS_HOST=localhost) -- see README's "Known gaps": every `conquer3`
-    # command today runs on the host, reaching postgres/redis via compose's
-    # host port mappings. Inside this container, `localhost` is the container
-    # itself -- these re-point at the compose service names instead (same fix
-    # `scorer`'s service block applies, and for the same reason).
-    environment:
-      POSTGRES_HOST: postgres
-      REDIS_HOST: redis
-      # OTEL_EXPORTER_OTLP_ENDPOINT is not overridden here -- .env's value is a
-      # real remote address, reachable the same way from inside this container
-      # as from the host, unlike POSTGRES_HOST/REDIS_HOST above (always ours).
+    # POSTGRES_HOST/REDIS_HOST come straight from .env, unmodified: the warehouse
+    # Postgres (Neon) and the account-state Redis (managed) are both external
+    # services, reachable directly from this container same as from the host.
+    # This file has no local `postgres`/`redis` service at all (see
+    # compose.parity.yaml for that local-native form) -- nothing to depends_on.
     volumes:
       - events:/events:ro
       - staging:/staging:ro
       - pathwaystate:/pathway-state
     networks: [c3net]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     restart: unless-stopped
     # Layer 3b: pipelines/pathway/run_backfill.py (static mode) and
     # run_streaming.py (streaming mode), selected by C3_PATHWAY_MODE (see
@@ -302,7 +245,7 @@ services:
   # ─────────────────────────────── serving ───────────────────────────────
   # This container IS the inference endpoint -- it pulls the champion artifact
   # out of remote MLflow once at boot and serves /invocations entirely from
-  # local files, local Redis, and local CPU from then on. It is not a gateway
+  # local files, managed Redis, and local CPU from then on. It is not a gateway
   # or proxy in front of remote MLflow; see README's Layer 5 section.
   scorer:
     build:
@@ -311,17 +254,20 @@ services:
     profiles: [serving]
     env_file:
       - .env
-    # .env's own values are host-friendly (REDIS_HOST=localhost,
-    # C3_MODEL_CACHE_DIR=data/models, ...) -- see README's "Known gaps": every
-    # `conquer3` command today runs on the host, reaching redis via compose's
-    # host port mapping. Inside this container, `localhost` is the container
-    # itself and `data/models` doesn't exist -- these overrides re-point both
-    # at the compose service name and the mounted volumes below.
+    # REDIS_HOST comes straight from .env, unmodified -- account-state Redis is
+    # an external managed service (see the `pathway` service's comment). Only the
+    # model-cache paths below are overridden: `data/models` is a host-relative
+    # path that doesn't exist inside this container, and needs to point at the
+    # mounted `modelcache` volume instead.
     environment:
-      REDIS_HOST: redis
       C3_MODEL_CACHE_DIR: /models
       C3_MODEL_CHAMPION_CACHE_FILE: /models/champion.json
       C3_ACTIVE_CHAMPION_FILE: /models/active.json
+      # Local dev only: bentoml serve --reload watches ./src (bind-mounted
+      # below) via watchfiles and restarts the child on change -- no more
+      # `docker compose build scorer` + recreate per edit. Never set this
+      # outside a dev compose file.
+      C3_SCORER_RELOAD: "true"
       # OTEL_EXPORTER_OTLP_ENDPOINT: not overridden -- see the same note on the
       # `pathway` service above.
     # Lets MLFLOW_TRACKING_URI=http://host.docker.internal:<port> reach an
@@ -332,14 +278,23 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
-      - "${C3_SCORER_PORT:-3000}:3000"
+      # C3_SCORER_HOST_PORT is deliberately a separate var from C3_SCORER_PORT:
+      # the latter also reaches the container via env_file and picks the
+      # in-container `bentoml serve --port` (see supervisor.py), which the
+      # healthcheck below and `EXPOSE 3000` assume is 3000. Remapping the
+      # published host port must not perturb that.
+      - "${C3_SCORER_HOST_PORT:-3000}:3000"
     volumes:
       - events:/events
       - modelcache:/models
+      - ./data/models:/models
+      # Local dev: host edits under src/ land in the container immediately --
+      # the editable install (serving.Dockerfile) makes `conquer3` resolve
+      # here instead of a copy baked into the image at build time.
+      - ./src:/app/src
     networks: [c3net]
-    depends_on:
-      redis:
-        condition: service_healthy
+    # No depends_on: account-state Redis is an external managed service, no local
+    # `redis` service in this file to depend on (see compose.parity.yaml).
     healthcheck:
       # BentoML's own readiness route: 500 until the workers finish __init__,
       # which is exactly "the champion is loaded". /livez and /healthz answer
@@ -357,8 +312,8 @@ services:
   # Streamlit console (Layer 9): Inference + Inspection tabs. A client of scorer
   # over HTTP -- holds no model, computes no feature. On its own profile since it
   # is a standalone, optional add-on: bringing it up also needs `serving` (for
-  # `scorer`) and `core` (for `postgres`) in scope, e.g.
-  #   docker compose --profile core --profile serving --profile ui up -d --build
+  # `scorer`) in scope, e.g.
+  #   docker compose --profile serving --profile ui up -d --build
   # `--profile ui` alone cannot resolve `depends_on: scorer` -- the same
   # profile-scoping hazard scripts/startup.sh already documents for `pathway`.
   ui:
@@ -368,10 +323,12 @@ services:
     profiles: [ui]
     env_file:
       - .env
-    # Same host-vs-container-path reasoning as `scorer`/`pathway` above: .env's
-    # own values are host-friendly, these re-point at compose service names.
+    # POSTGRES_HOST comes straight from .env, unmodified -- the warehouse Postgres
+    # is an external managed service (see the `pathway` service's comment).
+    # C3_SCORER_URL/C3_EVENT_DIR still need overriding: they're host-relative
+    # (localhost, a bind-mounted path) and must instead reach the `scorer` compose
+    # service and the `events` volume mounted into this container.
     environment:
-      POSTGRES_HOST: postgres
       C3_SCORER_URL: http://scorer:3000
       C3_EVENT_DIR: /events
     ports:
@@ -383,8 +340,6 @@ services:
     networks: [c3net]
     depends_on:
       scorer:
-        condition: service_healthy
-      postgres:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8501/_stcore/health"]

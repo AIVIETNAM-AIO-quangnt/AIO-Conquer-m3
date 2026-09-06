@@ -1,0 +1,74 @@
+# Non-secret tuning knobs, read by conquer3.config.settings alongside .env.
+#
+# .env stays for secrets and per-deployment connection info (hosts, ports,
+# credentials, URLs); this file holds business/tuning parameters instead --
+# versioned with the code, no env-var override (see settings.py for which
+# fields live here vs .env, and why).
+#
+# Path is resolved relative to the current working directory by default;
+# override with C3_CONFIG_PATH if that doesn't hold (see docker/airflow.Dockerfile).
+
+state:
+  key_prefix: c3
+  ttl_days: 90
+  cas_retries: 3
+  pg_fallback: false # keep Postgres out of the request hot path by default
+
+mlflow:
+  experiment_name: paysim-fraud
+
+model:
+  name: paysim-fraud-lightgbm
+  alias: champion
+  # Pins the scorer to this exact version (name + version), bypassing the
+  # alias entirely. The registry does now have "champion" aliased to this same
+  # version (v4), but the pin is left in place deliberately -- clear this
+  # (back to "") only as a separate, deliberate decision to resume normal
+  # champion-alias tracking, not as an incidental side effect of an unrelated
+  # change.
+  version: "4"
+  # Bounds MLFLOW_HTTP_REQUEST_TIMEOUT/MLFLOW_HTTP_REQUEST_MAX_RETRIES (mlflow's
+  # own env-driven knobs) -- mlflow's default (120s timeout, 7 retries) can
+  # block a dead tracking server for minutes even though each attempt is
+  # refused instantly.
+  resolve_timeout_s: 10
+  resolve_max_retries: 2
+
+pathway:
+  pg_sink: auto # auto | licensed | psycopg
+  mode: streaming # streaming | static
+  persist_dir: /pathway-state
+  autocommit_ms: 500
+  refresh_ms: 1000
+
+event:
+  dir: /events
+  staging_dir: /staging
+  rotate_seconds: 3600
+  fsync_interval_ms: 1000
+
+duck:
+  memory_limit: 4GB
+  threads: 4
+
+serving:
+  decision_threshold: 0.5
+  scorer_workers: 2
+  # Per-request timeout BentoML enforces (traffic.timeout), not a startup
+  # timeout. Also bounds how long the supervisor waits for a restarted server
+  # to confirm the promoted version.
+  scorer_timeout_s: 300
+  # How often the supervisor re-runs resolve_champion() after boot -- the only
+  # recurring contact with remote MLflow.
+  champion_poll_s: 300
+
+ui:
+  # Bounds the /events JSONL scan so a long-running scorer's accumulated
+  # history can never make the Inspection tab unloadable.
+  history_max_rows: 50000
+  history_max_files: 200
+  request_batch_size: 500
+  request_timeout_s: 240
+
+kaggle:
+  dataset: ealaxi/paysim1

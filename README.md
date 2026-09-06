@@ -72,6 +72,59 @@ uv run pytest tests/
 uv run conquer3 version
 ```
 
+## conquer3 CLI reference
+
+Every subcommand below (`src/conquer3/cli.py`) talks to Postgres/Redis/MLflow purely
+through `.env` -- it works identically whether they're the external managed services
+`.env` points at or a local instance, with no Docker or Airflow dependency. Because
+`conquer3`'s nested settings classes (`PgSettings`, `DuckSettings`, ...) only read real
+process env vars -- only the top-level `Settings` declares `env_file=".env"`, and that
+doesn't cascade into nested `BaseSettings` built via `default_factory` -- export `.env`
+into the shell first when running outside a container (Compose injects it as real env
+vars automatically; a bare host shell does not):
+
+```bash
+set -a; source .env; set +a
+```
+
+| Command | What it does |
+|---|---|
+| `conquer3 version` | Print version + feature/state schema versions |
+| `conquer3 features list` | List every feature name and its type |
+| `conquer3 db migrate` | Apply `db/ddl/*.sql` idempotently -- run once per database before anything else touches it |
+| `conquer3 db gen-gold-ddl [--check]` | Regenerate `db/ddl/30_gold.sql` from `core/schema.py` (`--check` fails if the committed file is stale) |
+| `conquer3 ingest download [--dest]` | Download the PaySim1 CSV from Kaggle (public, no credentials needed) |
+| `conquer3 ingest bronze [--csv]` | Load a PaySim1 CSV into `bronze.txn_raw` |
+| `conquer3 transform bronze-to-silver` | Type/clean `bronze.txn_raw` into `silver.txn` |
+| `conquer3 transform silver-to-gold` | Compute features from `silver.txn` into `gold.txn_features` |
+| `conquer3 transform export-staging` | Export `silver.txn` to JSONL staging for Pathway |
+| `conquer3 pathway backfill` | Static-mode: fold the staging snapshot once into account state |
+| `conquer3 pathway streaming` | Streaming-mode: continuously repair account state (long-running) |
+| `conquer3 model publish-dummy [--alias-champion]` | Publish a throwaway `DummyClassifier` -- smoke-tests the registry contract |
+| `conquer3 model resolve-champion [--name]` | Resolve the `"champion"` alias (live, falling back to the local cache) |
+| `conquer3 serve` | Run the scoring service (see "Running the scorer" below) |
+| `conquer3 ui` | Run the Streamlit console |
+| `conquer3 replay --out <path> [--csv] [--endpoint]` | Replay a raw PaySim1 CSV against `/predict`, for offline evaluation |
+
+The medallion pipeline runs in a fixed order -- each stage reads what the previous one
+wrote:
+
+```bash
+uv run conquer3 db migrate
+uv run conquer3 ingest bronze
+uv run conquer3 transform bronze-to-silver
+uv run conquer3 transform silver-to-gold
+uv run conquer3 transform export-staging
+uv run conquer3 pathway backfill
+```
+
+`make pipeline` (`.\make.ps1 pipeline` on Windows) runs migrate + ingest + the three
+transforms in one shot -- see `scripts/smoke/layer2_warehouse.sh` for the same sequence
+wrapped in DQ/consistency checks. `Makefile`/`make.ps1` also expose each stage on its
+own (`db-migrate`, `ingest-download`, `ingest-bronze`, `transform`, `pathway-backfill`,
+`pathway-streaming`) for re-running a single step -- e.g. after fixing a bad CSV --
+without repeating the whole pipeline; each already sources `.env` for you.
+
 ## Orchestrating services
 
 Nothing starts unless you pick a group -- there's no default "just run `make
@@ -405,7 +458,7 @@ src/conquer3/
 │                  # tabs), scorer_client.py (HTTP client -- never imports
 │                  # conquer3.serving), history.py (reads /events JSONL),
 │                  # labels.py (ops.prediction_labels), inference.py,
-│                  # inspection.py. A client of `scorer`; holds no model.
+│                  # inspection.py, benchmark.py. A client of `scorer`; holds no model.
 └── cli.py          # `conquer3` console script; every subcommand imports lazily
 
 airflow/

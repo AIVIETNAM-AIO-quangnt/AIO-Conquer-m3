@@ -26,21 +26,19 @@ def migrate_schema() -> str:
 
 @task
 def apply_indexes() -> str:
-    """Create indexes last, after bulk load is complete."""
+    """Create indexes last, after bulk load is complete.
+
+    Gold layer only -- bronze/silver indexing is entirely owned by
+    db/ddl/90_indexes.sql, applied idempotently via migrate_schema's apply_ddl()
+    above. This task used to also create idx_silver_txn_acct_ts (a 314MB strict
+    column-prefix duplicate of 90_indexes.sql's idx_silver_txn_account_ts) and
+    idx_silver_txn_ts_brin -- both removed so bronze/silver indexing has exactly
+    one owner instead of two DAGs racing to define overlapping indexes.
+    """
     from conquer3.db.engine import pg_connection
 
     with pg_connection() as conn:
         with conn.cursor() as cur:
-            # Hot index: (account_id, event_ts_us)
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_silver_txn_acct_ts
-                ON silver.txn (account_id, event_ts_us)
-            """)
-            # BRIN index on event_ts for range scans
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_silver_txn_ts_brin
-                ON silver.txn USING BRIN (event_ts_us)
-            """)
             # Gold layer indexes
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_gold_features_acct_ts

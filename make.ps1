@@ -22,6 +22,14 @@
     as soon as containers are merely started -- the same guarantee
     scripts/startup.sh's hand-rolled polling gives, without duplicating it.
 
+    `up` never passes `-build`: Compose still builds an image the first time
+    it's missing, but on every later `up` it reuses whatever image already
+    exists, even if the Dockerfile or build context changed since --
+    rebuilding only happens when explicitly requested via `build` (or
+    `core-build`/`stream-build`/`airflow-build`). This keeps `up` fast and
+    side-effect-free for the common case of just restarting or joining
+    already-running services.
+
 .EXAMPLE
     ./make.ps1 help
     ./make.ps1 core
@@ -63,6 +71,31 @@ function Get-EnvValue([string]$Name) {
     return ($line.Line -split "=", 2)[1].Trim()
 }
 
+# Bash equivalent: `set -a; source .env; set +a`. Needed only for the conquer3 CLI
+# targets below -- the Docker targets above never need it, since Compose injects
+# `.env` as real container env vars itself. conquer3's nested settings classes only
+# read real process env vars, and only the top-level Settings declares
+# env_file=".env", which doesn't cascade into nested BaseSettings built via
+# default_factory.
+function Import-DotEnv {
+    Test-EnvFile
+    Get-Content ".env" | ForEach-Object {
+        $line = $_.Trim()
+        if ($line -eq "" -or $line.StartsWith("#")) { return }
+        $idx = $line.IndexOf("=")
+        if ($idx -lt 1) { return }
+        $name = $line.Substring(0, $idx)
+        $value = $line.Substring($idx + 1)
+        Set-Item -Path "Env:$name" -Value $value
+    }
+}
+
+function Invoke-Conquer3([string[]]$ConquerArgs) {
+    Import-DotEnv
+    & uv run conquer3 @ConquerArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
 function Invoke-Compose {
     param([string]$Profiles, [string[]]$ComposeArgs)
     $env:COMPOSE_PROFILES = $Profiles
@@ -78,7 +111,8 @@ conquer3 docker-compose orchestration
   ./make.ps1 stream                up streaming: pathway
   ./make.ps1 airflow               up airflow: postgres, init, apiserver,
                                    scheduler, dag-processor, triggerer
-  ./make.ps1 up                    bring up all three groups
+  ./make.ps1 up                    bring up all three groups (never rebuilds
+                                   images -- see 'build' below)
   ./make.ps1 down                  tear down every profile
   ./make.ps1 ps                    show status across every profile
   ./make.ps1 logs [-Service x]     follow logs (all profiles, optionally scoped)
@@ -97,6 +131,16 @@ conquer3 docker-compose orchestration
 
   Per-group variants (swap the prefix): core-down, core-logs, core-ps,
   core-restart, core-build, stream-down, ..., airflow-down, ...
+
+  conquer3 CLI (host-side, no Docker -- see README.md's 'conquer3 CLI
+  reference' for the full command surface):
+  ./make.ps1 db-migrate          apply db/ddl/*.sql idempotently
+  ./make.ps1 ingest-download     download the PaySim1 CSV from Kaggle
+  ./make.ps1 ingest-bronze       load the CSV into bronze.txn_raw
+  ./make.ps1 transform           bronze-to-silver -> silver-to-gold -> export-staging
+  ./make.ps1 pathway-backfill    static-mode: fold staging into account state
+  ./make.ps1 pathway-streaming   streaming-mode: continuously repair account state
+  ./make.ps1 pipeline            db-migrate + ingest-bronze + transform, in order
 "@
 }
 
@@ -109,7 +153,7 @@ function Up-Core {
         Write-Host "  (and register+alias a champion), then re-run './make.ps1 core'."
         return
     }
-    Invoke-Compose -Profiles $CoreProfiles -ComposeArgs @("up", "-d", "--build", "--wait", "--wait-timeout", "$CoreWaitTimeout")
+    Invoke-Compose -Profiles $CoreProfiles -ComposeArgs @("up", "-d", "--wait", "--wait-timeout", "$CoreWaitTimeout")
 }
 function Down-Core    { Test-EnvFile; Invoke-Compose -Profiles $CoreProfiles -ComposeArgs @("down") }
 function Ps-Core       { Test-EnvFile; Invoke-Compose -Profiles $CoreProfiles -ComposeArgs @("ps") }
@@ -124,7 +168,7 @@ function Logs-Core {
 
 function Up-Stream {
     Test-EnvFile
-    Invoke-Compose -Profiles $StreamProfiles -ComposeArgs @("up", "-d", "--build", "--wait", "--wait-timeout", "$StreamWaitTimeout")
+    Invoke-Compose -Profiles $StreamProfiles -ComposeArgs @("up", "-d", "--wait", "--wait-timeout", "$StreamWaitTimeout")
 }
 function Down-Stream    { Test-EnvFile; Invoke-Compose -Profiles $StreamProfiles -ComposeArgs @("down") }
 function Ps-Stream       { Test-EnvFile; Invoke-Compose -Profiles $StreamProfiles -ComposeArgs @("ps") }
@@ -139,7 +183,7 @@ function Logs-Stream {
 
 function Up-Airflow {
     Test-EnvFile
-    Invoke-Compose -Profiles $AirflowProfiles -ComposeArgs @("up", "-d", "--build", "--wait", "--wait-timeout", "$AirflowWaitTimeout")
+    Invoke-Compose -Profiles $AirflowProfiles -ComposeArgs @("up", "-d", "--wait", "--wait-timeout", "$AirflowWaitTimeout")
 }
 function Down-Airflow    { Test-EnvFile; Invoke-Compose -Profiles $AirflowProfiles -ComposeArgs @("down") }
 function Ps-Airflow       { Test-EnvFile; Invoke-Compose -Profiles $AirflowProfiles -ComposeArgs @("ps") }
@@ -181,6 +225,29 @@ function Logs-All {
     Invoke-Compose -Profiles $AllProfiles -ComposeArgs $composeArgs
 }
 
+# conquer3 CLI (host-side, no Docker)
+function Db-Migrate      { Invoke-Conquer3 @("db", "migrate") }
+function Ingest-Download { Invoke-Conquer3 @("ingest", "download") }
+function Ingest-Bronze   { Invoke-Conquer3 @("ingest", "bronze") }
+function Transform {
+    Invoke-Conquer3 @("transform", "bronze-to-silver")
+    Invoke-Conquer3 @("transform", "silver-to-gold")
+    Invoke-Conquer3 @("transform", "export-staging")
+}
+function Pathway-Backfill  { Invoke-Conquer3 @("pathway", "backfill") }
+function Pathway-Streaming { Invoke-Conquer3 @("pathway", "streaming") }
+
+# migrate is cheap and idempotent, so it's included here rather than left as a
+# separate manual step -- matches scripts/smoke/layer2_warehouse.sh's sequence, minus
+# the DQ/consistency checks that script adds around it. pathway-backfill is kept out
+# (mirrors dag_medallion_batch/dag_feature_backfill's own separation): it needs Redis
+# reachable too, not just Postgres+DuckDB, and is its own retriggerable stage.
+function Pipeline {
+    Db-Migrate
+    Ingest-Bronze
+    Transform
+}
+
 switch ($Target) {
     "help"           { Show-Help }
     "core"           { Up-Core }
@@ -211,6 +278,13 @@ switch ($Target) {
     "restart"        { Restart-All }
     "clean"          { Clean-All }
     "build"          { Build-All }
+    "db-migrate"        { Db-Migrate }
+    "ingest-download"   { Ingest-Download }
+    "ingest-bronze"     { Ingest-Bronze }
+    "transform"         { Transform }
+    "pathway-backfill"  { Pathway-Backfill }
+    "pathway-streaming" { Pathway-Streaming }
+    "pipeline"          { Pipeline }
     default {
         Write-Error "Unknown target: $Target"
         Show-Help

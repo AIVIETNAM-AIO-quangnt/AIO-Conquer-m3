@@ -11,18 +11,28 @@ def test_defaults_load_without_any_env_vars(monkeypatch) -> None:
             monkeypatch.delenv(var, raising=False)
     settings = Settings(_env_file=None)
     assert settings.pg.host == "localhost"
+    assert settings.pg.sslmode == "require"
+    assert settings.pg.channel_binding == "require"
     assert settings.otel.enabled is False
     assert settings.pathway.pg_sink == "auto"
 
 
 def test_nested_env_prefix_overrides(monkeypatch) -> None:
     monkeypatch.setenv("POSTGRES_HOST", "warehouse.internal")
-    monkeypatch.setenv("C3_MODEL_ALIAS", "shadow")
     monkeypatch.setenv("PATHWAY_LICENSE_KEY", "abc123")
     settings = Settings(_env_file=None)
     assert settings.pg.host == "warehouse.internal"
-    assert settings.model.alias == "shadow"
     assert settings.pathway.license_key == "abc123"
+
+
+def test_model_alias_is_yaml_only_and_ignores_its_similarly_named_env_var(monkeypatch) -> None:
+    """C3_MODEL_ALIAS/C3_MODEL_NAME look like real overrides but are deliberately
+    inert -- see settings.py's module docstring ("two config sources, split by
+    kind, never both for the same field"). model.name/alias are yaml-sourced
+    only; this guards against that ever silently changing."""
+    monkeypatch.setenv("C3_MODEL_ALIAS", "shadow")
+    settings = Settings(_env_file=None)
+    assert settings.model.alias == "champion"
 
 
 def test_otel_disabled_without_endpoint(monkeypatch) -> None:

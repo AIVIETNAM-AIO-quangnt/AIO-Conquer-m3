@@ -1,10 +1,14 @@
 """The feature contract: names, types, and versions.
 
-``FEATURE_NAMES`` is the **single source of truth** for the model's input columns.
-The Postgres ``gold.txn_features`` DDL, the Pathway output projection, the sklearn
-ColumnTransformer, and the model signature are all generated from these lists --
-never hand-maintained in parallel. Adding a feature is: edit this file, regenerate
-the DDL, bump ``FEATURE_SCHEMA_VERSION``, retrain.
+``FEATURE_NAMES`` is the **single source of truth** for the served model's input
+columns. The Postgres ``gold.txn_features`` DDL, the Pathway output projection, the
+sklearn ColumnTransformer, and the model signature are all generated from these
+lists -- never hand-maintained in parallel. Adding a feature is: edit this file,
+regenerate the DDL, bump ``FEATURE_SCHEMA_VERSION``, retrain.
+
+``gold.txn_features`` additionally carries ``EXTERNAL_MODEL_FEATURES`` -- reserved
+columns for other MLflow-registered models' own feature names, kept deliberately
+separate from ``FEATURE_NAMES`` (see that constant's docstring below).
 
 This module imports nothing. Keep it that way.
 """
@@ -122,6 +126,88 @@ FORBIDDEN_FEATURE_SOURCES: Final[frozenset[str]] = frozenset(
     {"is_fraud", "is_flagged_fraud", "isFraud", "isFlaggedFraud", "account_id", "dest_id"}
 )
 
+# Feature columns other MLflow-registered model families declare as their own inputs
+# -- paysim-fraud-decision_tree, -lightgbm, -rf, -xgb-baseline, -xgb-enhanced,
+# -xgb-optimal, -xgb_vanila (checked against the live registry; none of them carry
+# this codebase's feature_schema_version tag, so none can ever become champion --
+# see contracts.model_registry.verify_compatible). NOT part of the model contract:
+# conquer3.core.features never computes these, FEATURE_SCHEMA_VERSION does not cover
+# them, and the live scorer never reads them. They exist purely so gold.txn_features
+# has room for every registered model's declared columns -- a job that scores with a
+# non-champion model can select the columns it needs from this table instead of
+# hitting "column does not exist". Expect most rows to leave these NULL until a
+# dedicated job backfills that specific model's features (see TODO.md).
+#
+# Deduplicated against FEATURE_NAMES and FORBIDDEN_FEATURE_SOURCES: a name already
+# covered by an existing column is not repeated here (e.g. "amount", "hour_of_day"),
+# and paysim-fraud-lightgbm v4's own "isFlaggedFraud" input -- a label leak
+# FORBIDDEN_FEATURE_SOURCES already blocks -- is dropped in favour of the existing
+# `is_flagged_fraud` label column. Where the same name surfaced with conflicting
+# numeric types across models (e.g. double vs. long), the wider `double precision`
+# was kept. See ``db/ddl_gen.py`` for how this renders into the DDL.
+EXTERNAL_MODEL_FEATURES: Final[tuple[tuple[str, str], ...]] = (
+    ("amount_log", "double precision"),
+    ("amount_log10", "double precision"),
+    ("amount_log_zscore_by_type_hour", "double precision"),
+    ("amount_ratio", "double precision"),
+    ("amount_to_dest_mean_ratio", "double precision"),
+    ("amount_to_orig_mean_ratio", "double precision"),
+    ("amount_zscore_by_type_hour", "double precision"),
+    ("current_amount", "double precision"),
+    ("day_index", "integer"),
+    ("day_of_week", "integer"),
+    ("dest_amount_mean", "double precision"),
+    ("dest_amount_mean_hist", "double precision"),
+    ("dest_amount_sum_hist", "double precision"),
+    ("dest_cashout_freq", "integer"),
+    ("dest_count_hist", "bigint"),
+    ("dest_freq", "integer"),
+    ("dest_is_frequent", "integer"),
+    ("dest_risk_target_enc", "double precision"),
+    ("dest_type_count", "integer"),
+    ("dest_velocity_1h", "integer"),
+    ("dest_velocity_24h", "integer"),
+    ("dest_velocity_surge_ratio", "double precision"),
+    ("edge_count_hist", "bigint"),
+    ("edge_is_new", "integer"),
+    ("f1", "double precision"),
+    ("f2", "double precision"),
+    ("f3", "double precision"),
+    ("hour_cos", "double precision"),
+    ("hour_day", "integer"),
+    ("hour_sin", "double precision"),
+    ("is_capped_10m", "integer"),
+    ("is_customer_dest", "integer"),
+    ("is_mule_chain", "integer"),
+    ("is_night", "integer"),
+    ("is_rapid_passthrough", "integer"),
+    ("is_round_10k", "integer"),
+    ("is_round_1k", "integer"),
+    ("is_transfer", "integer"),
+    ("is_weekend", "integer"),
+    ("log_amount", "double precision"),
+    ("mule_time_since_transfer", "double precision"),
+    ("orig_amount_mean_hist", "double precision"),
+    ("orig_amount_sum_hist", "double precision"),
+    ("orig_count_hist", "bigint"),
+    ("orig_is_first_seen", "integer"),
+    ("orig_velocity_1h", "integer"),
+    ("orig_velocity_24h", "integer"),
+    ("pit_distinct_senders_168h", "double precision"),
+    ("pit_distinct_senders_24h", "double precision"),
+    ("pit_prior_amount_168h", "double precision"),
+    ("pit_prior_amount_1h", "double precision"),
+    ("pit_prior_amount_24h", "double precision"),
+    ("pit_prior_count_1h", "double precision"),
+    ("pit_prior_count_24h", "double precision"),
+    ("pit_steps_since_last_event", "double precision"),
+    ("step", "bigint"),
+    ("step_day", "integer"),
+    ("transaction_type_transfer", "double precision"),
+    ("type", "text"),
+    ("type_code", "integer"),
+)
+
 # Postgres column type per feature, used to generate gold.txn_features DDL.
 PG_TYPE_NUMERIC: Final[str] = "double precision"
 PG_TYPE_CATEGORICAL: Final[str] = "text"
@@ -150,3 +236,12 @@ def validate() -> None:
     leaked = set(FEATURE_NAMES) & FORBIDDEN_FEATURE_SOURCES
     if leaked:
         raise ValueError(f"label-leaking columns present in FEATURE_NAMES: {sorted(leaked)}")
+    ext_names = [name for name, _ in EXTERNAL_MODEL_FEATURES]
+    if len(set(ext_names)) != len(ext_names):
+        dupes = sorted({n for n in ext_names if ext_names.count(n) > 1})
+        raise ValueError(f"duplicate names in EXTERNAL_MODEL_FEATURES: {dupes}")
+    reused = (set(ext_names) & set(FEATURE_NAMES)) | (set(ext_names) & FORBIDDEN_FEATURE_SOURCES)
+    if reused:
+        raise ValueError(
+            f"EXTERNAL_MODEL_FEATURES reuses a FEATURE_NAMES/forbidden name: {sorted(reused)}"
+        )

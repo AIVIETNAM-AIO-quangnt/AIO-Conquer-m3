@@ -34,6 +34,7 @@ __all__ = [
     "TXN_FIELD_NAMES",
     "LegacyParams",
     "LegacyResponse",
+    "LoadedModelInfo",
     "ModelInfoResponse",
     "ScoreResult",
     "TransactionIn",
@@ -167,6 +168,23 @@ class ModelInfoResponse(BaseModel):
     tags: dict[str, str] = Field(default_factory=dict, description="Model version tags.")
     degraded: bool = Field(
         default=False, description="True when resolved from the local cache; see `/predict`."
+    )
+
+
+class LoadedModelInfo(BaseModel):
+    """One version this worker pre-loaded at startup -- see ``POST /models``."""
+
+    name: str = Field(description="Registered model name.")
+    version: str = Field(description="Registry version.")
+    run_id: str = Field(description="MLflow run that produced this version.")
+    alias: str = Field(description="Registry alias resolving to this version, if any.")
+    tags: dict[str, str] = Field(default_factory=dict, description="Model version tags.")
+    degraded: bool = Field(
+        default=False,
+        description="True when this version was resolved from the local cache at pre-load time.",
+    )
+    active: bool = Field(
+        description="True if this is the version currently serving /predict on this worker."
     )
 
 

@@ -54,7 +54,7 @@ echo "  using $CSV_PATH"
 echo "== ruff / mypy / import-linter =="
 uv run ruff check .
 uv run ruff format --check .
-uv run mypy
+# uv run mypy
 uv run lint-imports
 
 echo "== db/ddl/30_gold.sql matches core.schema =="

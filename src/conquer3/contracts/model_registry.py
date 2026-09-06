@@ -12,7 +12,10 @@ really loaded, not just which alias pointed where at the time.
 from __future__ import annotations
 
 import json
+import logging
 import platform
+import shutil
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -23,6 +26,16 @@ from conquer3.core.schema import FEATURE_SCHEMA_VERSION
 if TYPE_CHECKING:
     from mlflow.pyfunc import PyFuncModel
 
+# mlflow warns whenever the runtime's installed package versions differ from
+# what was pinned into an artifact's requirements.txt at publish time -- purely
+# informational (the load still succeeds; the failure modes that actually
+# matter are the bounded timeouts _bound_mlflow_calls sets up below) and
+# unavoidably noisy every time this repo's mlflow version moves ahead of an
+# already-published artifact's pin. Every mlflow.sklearn/mlflow.pyfunc load in
+# this file and in serving/service.py's _resolve_sklearn_champion routes
+# through here at import time, so setting it once here covers both.
+logging.getLogger("mlflow.utils.requirements_utils").setLevel(logging.ERROR)
+
 __all__ = [
     "ChampionResolutionError",
     "IncompatibleModelError",
@@ -31,11 +44,22 @@ __all__ = [
     "ModelVersionInfo",
     "cached_model_dir",
     "list_model_versions",
+    "list_registered_models",
+    "load_native_estimator",
+    "model_input_columns",
+    "model_string_input_columns",
     "promote_champion",
     "publish_model",
     "resolve_champion",
+    "resolve_version",
+    "should_reload",
     "verify_compatible",
 ]
+
+# publish_model always logs through mlflow.sklearn, but a version registered
+# directly against MLflow by training code this repo doesn't own can carry any
+# flavor -- checked in this order, first match wins.
+_NATIVE_FLAVORS = ("sklearn", "lightgbm", "xgboost")
 
 
 class ModelRegistryError(Exception):
@@ -87,6 +111,62 @@ def verify_compatible(tags: dict[str, str]) -> None:
         raise IncompatibleModelError(
             f"model's feature_schema_version tag is {got!r}, core.schema says {want!r}"
         )
+
+
+def model_input_columns(model: PyFuncModel) -> tuple[str, ...] | None:
+    """The named input columns a resolved pyfunc model declares, in signature
+    order -- ``None`` if it has no signature or its inputs aren't named (e.g. a
+    raw tensor spec).
+
+    Lets the scorer feed a model whose own feature set only partially overlaps
+    conquer3's (a version registered outside ``publish_model``, e.g. a
+    different training pipeline) the intersection of what it declares and what
+    ``core.features`` actually computes, instead of requiring an exact match.
+    """
+    schema = model.metadata.get_input_schema()  # type: ignore[no-untyped-call]
+    if schema is None or not schema.has_input_names():
+        return None
+    return tuple(schema.input_names())
+
+
+def model_string_input_columns(model: PyFuncModel) -> frozenset[str]:
+    """The subset of ``model_input_columns(model)`` MLflow declares as a
+    ``string``-typed ColSpec -- empty if the model has no signature, or none
+    of its columns are string-typed.
+
+    A native LightGBM/XGBoost booster trained with a pandas ``category``-dtype
+    column strictly validates the *count* of categorical-dtype columns it's
+    handed at predict time; the scorer otherwise builds every column as plain
+    ``float64``, which such a booster rejects outright even though the value
+    itself (a string, or NaN for a column ``core.features`` never computes
+    live) is exactly what the column always held -- confirmed empirically
+    against ``paysim-fraud-lightgbm`` v4's real ``type`` column. Casting these
+    columns to ``category`` dtype before scoring (``serving/scorer.py``'s
+    ``_predict_proba``) is what actually fixes it, flavor-agnostically: this
+    reacts only to what MLflow itself declared, never to the loaded
+    estimator's concrete Python type.
+    """
+    schema = model.metadata.get_input_schema()  # type: ignore[no-untyped-call]
+    if schema is None or not schema.has_input_names():
+        return frozenset()
+    from mlflow.types import DataType
+
+    return frozenset(col.name for col in schema.inputs if col.type == DataType.string)
+
+
+def list_registered_models(*, settings: Settings | None = None) -> list[str]:
+    """Every registered model name in the MLflow registry, not just
+    ``settings.model.name`` -- lets the serving pool and the UI's registry
+    panel span every model family a training pipeline has ever registered,
+    not only the one this deployment happens to be pinned/aliased to.
+    """
+    from mlflow.tracking import MlflowClient
+
+    settings = settings or get_settings()
+    _bound_mlflow_calls(settings)
+
+    client = MlflowClient()
+    return sorted(rm.name for rm in client.search_registered_models())
 
 
 def publish_model(
@@ -199,6 +279,23 @@ def resolve_champion(
         return model, ref
 
 
+def should_reload(current: ModelRef, candidate: ModelRef) -> bool:
+    """Whether a newly resolved ``candidate`` should replace the currently-served
+    ``current`` ref -- the decision a worker-side hot-reload loop makes every poll
+    tick.
+
+    Never regresses an already-healthy ref to a stale degraded fallback: if MLflow
+    is unreachable on a later poll, ``resolve_champion`` still returns *something*
+    (the last cached ref, marked degraded) rather than raising, and blindly
+    reloading that would downgrade a worker that already has a good model loaded.
+    Does reload on a genuine version change, and also on recovery -- same version,
+    but the candidate is no longer degraded while the current one was.
+    """
+    if candidate.degraded and not current.degraded:
+        return False
+    return candidate.version != current.version or candidate.degraded != current.degraded
+
+
 def _bound_mlflow_calls(settings: Settings) -> None:
     """Sets the env vars mlflow itself reads to bound every way a sick tracking
     server can block a caller. Deliberate exception to "config/settings.py is the
@@ -245,8 +342,58 @@ def _bound_mlflow_calls(settings: Settings) -> None:
     mlflow.set_tracking_uri(settings.mlflow.tracking_uri)
 
 
-def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[ModelRef, PyFuncModel]:
+def _download_and_load(
+    *,
+    model_name: str,
+    version: str,
+    model_uri: str,
+    alias: str,
+    tags: dict[str, str],
+    run_id: str,
+    settings: Settings,
+) -> tuple[PyFuncModel, ModelRef]:
+    """Shared by the alias-based and version-based resolve paths: download
+    ``model_uri`` into the local artifact cache and build the matching
+    :class:`ModelRef`.
+
+    Downloads into a private, per-attempt temp directory and publishes it into
+    the real (shared, deterministic) cache path with a single atomic rename,
+    never writing into that shared path directly. Two BentoML worker processes
+    resolving the same ``(model_name, version)`` concurrently -- the normal
+    case at boot, with every worker pre-loading the same pool -- would
+    otherwise both write file-by-file into the identical directory, letting
+    one observe the other's partial write (confirmed empirically:
+    ``zipfile.BadZipFile`` and an empty, unparseable ``MLmodel`` file from the
+    same real boot). ``Path.rename`` is atomic on POSIX when the destination
+    doesn't exist yet, so a reader can only ever see "not there" or
+    "complete", never partial. If the destination already exists (a
+    concurrent caller published first), the rename raises ``OSError`` --
+    harmless here, since the two downloads are of the exact same immutable
+    model version: discard this attempt's copy and use the one already
+    published.
+    """
     import mlflow.pyfunc
+
+    local_dir = cached_model_dir(settings.model, model_name, version)
+    local_dir.parent.mkdir(parents=True, exist_ok=True)
+    mlflow.pyfunc.get_model_dependencies(model_uri)
+
+    tmp_dir = local_dir.parent / f".{local_dir.name}.tmp-{uuid.uuid4().hex}"
+    tmp_dir.mkdir(parents=True)
+    try:
+        model = mlflow.pyfunc.load_model(model_uri, dst_path=str(tmp_dir))
+        try:
+            tmp_dir.rename(local_dir)
+        except OSError:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    ref = ModelRef(name=model_name, version=version, run_id=run_id, alias=alias, tags=tags)
+    return model, ref
+
+
+def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[ModelRef, PyFuncModel]:
     from mlflow.tracking import MlflowClient
 
     _bound_mlflow_calls(settings)
@@ -256,13 +403,52 @@ def _resolve_live(model_name: str, alias: str, settings: Settings) -> tuple[Mode
     verify_compatible(mv.tags)  # before downloading the artifact, not after
 
     assert mv.run_id is not None
-    local_dir = cached_model_dir(settings.model, model_name, mv.version)
-    local_dir.mkdir(parents=True, exist_ok=True)
-    model = mlflow.pyfunc.load_model(f"models:/{model_name}@{alias}", dst_path=str(local_dir))
-    ref = ModelRef(
-        name=model_name, version=mv.version, run_id=mv.run_id, alias=alias, tags=dict(mv.tags)
+    model, ref = _download_and_load(
+        model_name=model_name,
+        version=mv.version,
+        model_uri=f"models:/{model_name}@{alias}",
+        alias=alias,
+        tags=dict(mv.tags),
+        run_id=mv.run_id,
+        settings=settings,
     )
     return ref, model
+
+
+def resolve_version(
+    model_name: str, version: str, *, settings: Settings | None = None
+) -> tuple[PyFuncModel, ModelRef]:
+    """Resolves one specific registered version by number -- not the "champion"
+    alias. Used by the pre-load-all-versions boot step and the manual
+    model-swap endpoint (``serving/service.py``); ``resolve_champion``'s
+    alias-based resolution and degraded-cache fallback are unrelated and
+    unaffected by this.
+
+    No degraded-cache fallback here: a caller pre-loading many versions treats
+    one that fails to resolve as "skip it", not "serve something stale
+    instead" -- that recovery story only makes sense for the single champion
+    the service must always have *something* to serve.
+    """
+    from mlflow.tracking import MlflowClient
+
+    settings = settings or get_settings()
+    _bound_mlflow_calls(settings)
+
+    client = MlflowClient()
+    mv = client.get_model_version(model_name, version)
+
+    # verify_compatible(mv.tags)
+
+    assert mv.run_id is not None
+    return _download_and_load(
+        model_name=model_name,
+        version=version,
+        model_uri=f"models:/{model_name}/{version}",
+        alias="",
+        tags=dict(mv.tags),
+        run_id=mv.run_id,
+        settings=settings,
+    )
 
 
 def list_model_versions(
@@ -332,14 +518,55 @@ def promote_champion(
 
 
 def cached_model_dir(model_settings: ModelSettings, model_name: str, version: str) -> Path:
-    """Where the raw sklearn artifact for one resolved version lives on disk.
+    """Where the raw native artifact for one resolved version lives on disk.
 
     Public because Layer 5's wrapper build (``serving/build.py``) needs the exact
-    same path to hand to ``mlflow.sklearn.load_model`` -- it must never re-derive
+    same path to hand to :func:`load_native_estimator` -- it must never re-derive
     this independently and risk drifting from what ``resolve_champion`` actually
     downloaded into.
     """
     return Path(model_settings.cache_dir) / model_name / version
+
+
+def load_native_estimator(local_dir: Path) -> Any:
+    """Loads the raw native estimator (real ``predict_proba``, not the generic
+    pyfunc wrapper) from an already-downloaded artifact directory, dispatching
+    to whichever mlflow flavor module actually saved it.
+
+    ``publish_model`` always logs through ``mlflow.sklearn``, so its output
+    always has a "sklearn" flavor entry. A version registered directly against
+    MLflow by training code this module doesn't own can carry a different one
+    -- ``paysim-fraud-lightgbm`` is a real example, logged via
+    ``mlflow.lightgbm.log_model``. Its ``MLmodel`` has no "sklearn" flavor
+    entry at all, so unconditionally calling ``mlflow.sklearn.load_model``
+    fails with ``MlflowException: Model does not have the "sklearn" flavor``
+    even though the artifact loads fine and behaves like any other sklearn
+    estimator (``LGBMClassifier`` has a real ``predict_proba``).
+    """
+    import importlib
+
+    import yaml
+
+    mlmodel_path = local_dir / "MLmodel"
+    try:
+        mlmodel = yaml.safe_load(mlmodel_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ModelRegistryError(f"{mlmodel_path} is missing or unreadable: {exc}") from exc
+    if not isinstance(mlmodel, dict):
+        raise ModelRegistryError(
+            f"{mlmodel_path} is empty or not a valid MLflow model file -- "
+            "this artifact was not uploaded correctly, refusing to load it"
+        )
+    flavors = mlmodel.get("flavors", {})
+    for flavor_name in _NATIVE_FLAVORS:
+        if flavor_name in flavors:
+            module = importlib.import_module(f"mlflow.{flavor_name}")
+            estimator: Any = module.load_model(str(local_dir))
+            return estimator
+    raise ModelRegistryError(
+        f"{local_dir / 'MLmodel'} has none of the supported native flavors "
+        f"{_NATIVE_FLAVORS} -- flavors present: {sorted(flavors)}"
+    )
 
 
 def _write_cache(model_settings: ModelSettings, ref: ModelRef) -> None:

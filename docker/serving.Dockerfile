@@ -20,7 +20,12 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install --no-cache-dir ".[serving]"
+# Editable install: `conquer3` resolves back to /app/src rather than a copy
+# baked into site-packages, so docker-compose.yaml's ./src bind mount (local
+# dev) actually takes effect without a rebuild. Behaves identically to a
+# normal install when nothing is mounted over /app/src (e.g. a plain
+# `docker build` with no compose bind mount).
+RUN pip install --no-cache-dir -e ".[serving]"
 
 EXPOSE 3000
 CMD ["conquer3", "serve"]

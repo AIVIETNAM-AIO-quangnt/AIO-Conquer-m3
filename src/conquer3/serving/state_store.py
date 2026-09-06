@@ -35,9 +35,11 @@ class RedisStateStore:
     def __init__(self, *, redis_settings: RedisSettings, state_settings: StateSettings) -> None:
         self._client = redis.Redis(
             host=redis_settings.host,
+            username=redis_settings.username,
             port=redis_settings.port,
             db=redis_settings.db,
             password=redis_settings.password,
+            ssl=redis_settings.tls,
             decode_responses=True,
         )
         self._cas = self._client.register_script(_CAS_SCRIPT)
