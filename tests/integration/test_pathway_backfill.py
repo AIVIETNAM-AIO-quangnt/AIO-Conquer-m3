@@ -64,6 +64,9 @@ def warehouse(
         monkeypatch.setenv("POSTGRES_DB", pg.dbname)
         monkeypatch.setenv("POSTGRES_USER", pg.username)
         monkeypatch.setenv("POSTGRES_PASSWORD", pg.password)
+        # The testcontainers postgres:17-alpine image has no SSL configured.
+        monkeypatch.setenv("POSTGRES_SSLMODE", "disable")
+        monkeypatch.setenv("POSTGRES_CHANNEL_BINDING", "disable")
         monkeypatch.setenv("REDIS_HOST", redis_c.get_container_host_ip())
         monkeypatch.setenv("REDIS_PORT", str(redis_c.get_exposed_port(6379)))
         monkeypatch.setenv("C3_DUCKDB_PATH", str(tmp_path / "analytics.duckdb"))
@@ -153,37 +156,48 @@ def _run_backfill(
 
 
 def _dump_account_state(pg_env: dict[str, str]) -> dict[str, dict[str, Any]]:
-    import psycopg
+    import psycopg2
 
     dsn = (
         f"host={pg_env['POSTGRES_HOST']} port={pg_env['POSTGRES_PORT']} "
         f"dbname={pg_env['POSTGRES_DB']} user={pg_env['POSTGRES_USER']} "
         f"password={pg_env['POSTGRES_PASSWORD']}"
     )
-    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT account_id, state_version, state_json, updated_at_us FROM gold.account_state"
-        )
-        return {
-            account_id: {
-                "state_version": state_version,
-                "state": json.loads(state_json),
-                "updated_at_us": updated_at_us,
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT account_id, state_version, state_json, updated_at_us "
+                "FROM gold.account_state"
+            )
+            return {
+                account_id: {
+                    "state_version": state_version,
+                    "state": json.loads(state_json),
+                    "updated_at_us": updated_at_us,
+                }
+                for account_id, state_version, state_json, updated_at_us in cur.fetchall()
             }
-            for account_id, state_version, state_json, updated_at_us in cur.fetchall()
-        }
+    finally:
+        conn.close()
 
 
 def _truncate_account_state(pg_env: dict[str, str]) -> None:
-    import psycopg
+    import psycopg2
 
     dsn = (
         f"host={pg_env['POSTGRES_HOST']} port={pg_env['POSTGRES_PORT']} "
         f"dbname={pg_env['POSTGRES_DB']} user={pg_env['POSTGRES_USER']} "
         f"password={pg_env['POSTGRES_PASSWORD']}"
     )
-    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute("TRUNCATE gold.account_state")
+    conn = psycopg2.connect(dsn)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE gold.account_state")
+    finally:
+        conn.close()
 
 
 def test_static_backfill_row_count_parity(

@@ -54,6 +54,9 @@ def warehouse(
         monkeypatch.setenv("POSTGRES_DB", pg.dbname)
         monkeypatch.setenv("POSTGRES_USER", pg.username)
         monkeypatch.setenv("POSTGRES_PASSWORD", pg.password)
+        # The testcontainers postgres:17-alpine image has no SSL configured.
+        monkeypatch.setenv("POSTGRES_SSLMODE", "disable")
+        monkeypatch.setenv("POSTGRES_CHANNEL_BINDING", "disable")
         get_settings.cache_clear()
         try:
             with pg_connection() as conn:

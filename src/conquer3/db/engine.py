@@ -12,11 +12,12 @@ Two connections, two jobs:
 
 from __future__ import annotations
 
-import fcntl
+import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 import psycopg2
 
@@ -27,12 +28,71 @@ if TYPE_CHECKING:
 
 __all__ = ["get_ibis_connection", "pg_connection"]
 
+# `fcntl.flock` doesn't exist on Windows -- the DuckDB file lock below (see
+# ``get_ibis_connection``'s docstring) needs a cross-platform exclusive lock on a
+# sidecar ``.lock`` file, so branch on the one primitive each platform actually has:
+# ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows. ``msvcrt.locking`` has no
+# blocking mode of its own (``LK_LOCK`` internally retries for ~10s then raises), so
+# both branches are built as a non-blocking probe plus our own retry loop, giving the
+# same indefinite-blocking semantics on both platforms.
+if sys.platform == "win32":
+    import msvcrt
+
+    def _try_lock(f: IO[str]) -> bool:
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(f: IO[str]) -> None:
+        try:
+            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+else:
+    import fcntl
+
+    def _try_lock(f: IO[str]) -> bool:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            return False
+
+    def _unlock(f: IO[str]) -> None:
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def _lock_blocking(f: IO[str]) -> None:
+    """Block until ``f`` is exclusively locked (see the platform ``_try_lock``s)."""
+    while not _try_lock(f):
+        time.sleep(0.2)
+
 
 @contextmanager
 def pg_connection(pg: PgSettings | None = None) -> Iterator[psycopg2.extensions.connection]:
-    """A short-lived, autocommit psycopg2 connection."""
+    """A short-lived, autocommit psycopg2 connection.
+
+    "Short-lived" is the intent, not a guarantee every caller honors --
+    ``bronze_to_silver``/``silver_to_gold`` keep one of these open (idle) across
+    ``ops.track_run`` while a *separate* Ibis/DuckDB connection does the actual
+    bulk transform, which can run for tens of minutes over the full table. Without
+    TCP keepalives, a connection idle that long gets silently dropped by whatever
+    sits between here and Postgres (cloud LB, NAT, pooler) with no FIN/RST -- the
+    next statement on it (``track_run``'s finishing ``UPDATE``) then fails as
+    ``OperationalError: SSL SYSCALL error: EOF detected`` instead of a clean,
+    retryable error. Keepalive probes are real packets, so they reset that
+    idle-timer even though no query is sent.
+    """
     settings = pg if pg is not None else get_settings().pg
-    conn = psycopg2.connect(settings.libpq_dsn)
+    conn = psycopg2.connect(
+        settings.libpq_dsn,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
     conn.autocommit = True
     try:
         yield conn
@@ -81,12 +141,18 @@ def get_ibis_connection(
             "outside the container that mounts them."
         ) from exc
 
-    lock_file = (db_path.parent / f"{db_path.name}.lock").open("w")
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    lock_path = db_path.parent / f"{db_path.name}.lock"
+    # Ensure the byte msvcrt.locking needs to lock exists *before* opening for the
+    # lock itself, and open with "r+" (not "w") from then on -- "w" truncates on
+    # every open, including a second caller's, which on Windows was observed to drop
+    # the first caller's still-held lock along with the truncated byte. fcntl.flock
+    # doesn't care about file content either way, so this is safe on POSIX too.
+    if not lock_path.exists():
+        lock_path.write_text("0")
+    lock_file = lock_path.open("r+")
+    if not _try_lock(lock_file):
         print(f"Waiting for DuckDB file lock on {db_path} (held by another process)...")
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        _lock_blocking(lock_file)
 
     try:
         con = ibis.duckdb.connect(
@@ -98,7 +164,7 @@ def get_ibis_connection(
         )
         con.raw_sql(f"ATTACH IF NOT EXISTS '{pg_settings.libpq_dsn}' AS pg (TYPE postgres)")
     except BaseException:
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        _unlock(lock_file)
         lock_file.close()
         raise
 
@@ -108,7 +174,7 @@ def get_ibis_connection(
         try:
             original_disconnect()
         finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            _unlock(lock_file)
             lock_file.close()
 
     con.disconnect = _disconnect_and_unlock

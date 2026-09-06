@@ -32,6 +32,7 @@ FORBIDDEN = [
     "sklearn",
     "joblib",
     "psycopg",
+    "psycopg2",
     "opentelemetry",
 ]
 
