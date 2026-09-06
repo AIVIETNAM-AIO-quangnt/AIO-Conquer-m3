@@ -62,12 +62,6 @@ def _axis_value(row: pd.Series, axis: str) -> float | str | None:
     return cast("float | str | None", source.get(axis))
 
 
-@st.cache_data(ttl=15, show_spinner=False)
-def _load_frame(events_dir: str, max_files: int, max_rows: int) -> pd.DataFrame:
-    events = history.load_recent_events(events_dir, max_files=max_files, max_rows=max_rows)
-    return history.events_to_frame(events)
-
-
 def _render_filters(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
@@ -253,7 +247,7 @@ def _render_plot(df: pd.DataFrame, ground_truth: pd.Series, *, threshold: float)
 
 
 def render(settings: Settings, knobs: dict[str, Any]) -> None:
-    df = _load_frame(
+    df = history.load_events_frame(
         settings.event.dir, settings.ui.history_max_files, settings.ui.history_max_rows
     )
     if df.empty:

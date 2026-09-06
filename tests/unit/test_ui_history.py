@@ -79,3 +79,11 @@ def test_events_to_frame_preserves_row_count_and_feature_dict(tmp_path: Path) ->
 
     assert len(frame) == 1
     assert frame.iloc[0]["features"]["log1p_amount"] == 4.6
+
+
+def test_events_to_frame_includes_model_name(tmp_path: Path) -> None:
+    _write_event(tmp_path, event_id="e1", scored_at_us=1_700_000_000_000_000, fraud_score=0.8)
+
+    frame = events_to_frame(load_recent_events(tmp_path))
+
+    assert frame.iloc[0]["model_name"] == "paysim_fraud_clf"

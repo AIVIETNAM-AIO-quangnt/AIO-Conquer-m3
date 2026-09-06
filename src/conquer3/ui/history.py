@@ -1,4 +1,4 @@
-"""Reads the scorer's scored-event JSONL history for the Inspection tab.
+"""Reads the scorer's scored-event JSONL history for the Inspection and Benchmark tabs.
 
 Reuses ``contracts.events`` wholesale -- the hour-partitioned path layout and the
 ``ScoredEvent`` record -- rather than re-deriving either; that module is
@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import streamlit as st
 
 from conquer3.contracts.events import SCORED_SUBDIR, ScoredEvent
 
-__all__ = ["events_to_frame", "filter_events", "load_recent_events"]
+__all__ = ["events_to_frame", "filter_events", "load_events_frame", "load_recent_events"]
 
 
 def _iter_jsonl_files(events_dir: Path, *, max_files: int) -> Iterator[Path]:
@@ -96,6 +97,7 @@ def events_to_frame(events: Sequence[ScoredEvent]) -> pd.DataFrame:
         "decision",
         "threshold",
         "had_prev_state",
+        "model_name",
         "model_version",
         "feature_schema_version",
         "transaction",
@@ -113,6 +115,7 @@ def events_to_frame(events: Sequence[ScoredEvent]) -> pd.DataFrame:
             "decision": e.decision,
             "threshold": e.threshold,
             "had_prev_state": e.had_prev_state,
+            "model_name": e.model_name,
             "model_version": e.model_version,
             "feature_schema_version": e.feature_schema_version,
             "transaction": e.transaction,
@@ -121,3 +124,12 @@ def events_to_frame(events: Sequence[ScoredEvent]) -> pd.DataFrame:
         for e in events
     ]
     return pd.DataFrame(rows, columns=list(columns))
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_events_frame(events_dir: str, max_files: int, max_rows: int) -> pd.DataFrame:
+    """Cached ``events_to_frame(load_recent_events(...))`` shared by every tab that
+    browses scored-event history, so two tabs open in the same session scan the
+    JSONL files once, not once per tab."""
+    events = load_recent_events(events_dir, max_files=max_files, max_rows=max_rows)
+    return events_to_frame(events)
