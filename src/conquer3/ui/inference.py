@@ -1,12 +1,12 @@
-"""Tab 1 -- score a hand-entered transaction or an uploaded CSV, and manage which
-MLflow version the scorer is aliased to serve.
+"""Tab 1 -- score a hand-entered transaction or an uploaded CSV.
+
+Model-version selection/promotion lives in the sidebar (ui/app.py), not here.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import json
-import time
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -15,13 +15,10 @@ import pandas as pd
 import streamlit as st
 
 from conquer3.config.settings import Settings
-from conquer3.contracts.model_registry import (
-    IncompatibleModelError,
-    list_model_versions,
-    promote_champion,
-)
 from conquer3.core.timeref import derive_step_from_ts_us
 from conquer3.core.types import TransactionEvent, TxnType
+from conquer3.db.accounts import InsufficientBalanceError, TransferResult, execute_transfer
+from conquer3.db.engine import pg_connection
 from conquer3.producer.replay import load_raw_paysim, to_transactions_frame
 from conquer3.ui.scorer_client import ScorerError, score_transactions
 
@@ -34,11 +31,15 @@ _FIELD_SAMPLE_VALUES: dict[str, float | str] = {
     "account_id": "C1",
     "dest_id": "M900",
     "amount": 181.0,
-    "oldbalance_org": 181.0,
-    "newbalance_orig": 0.0,
-    "oldbalance_dest": 0.0,
-    "newbalance_dest": 181.0,
 }
+# CASH_IN excluded: it models a merchant/agent crediting a person, which doesn't fit
+# this form's model (name_orig is always the sender being debited).
+_SELECTABLE_TXN_TYPES: tuple[TxnType, ...] = (
+    TxnType.PAYMENT,
+    TxnType.TRANSFER,
+    TxnType.DEBIT,
+    TxnType.CASH_OUT,
+)
 
 
 def _new_event_id() -> str:
@@ -47,6 +48,31 @@ def _new_event_id() -> str:
     # ops.prediction_labels and the join key back to silver.txn, so a hand-typed
     # duplicate would silently overwrite an existing label.
     return f"ui-{uuid4().hex[:12]}"
+
+
+def _build_transaction_row(
+    *,
+    event_id: str,
+    event_ts_us: int,
+    account_id: str,
+    dest_id: str,
+    txn_type: str,
+    amount: float,
+    transfer: TransferResult,
+) -> dict[str, Any]:
+    return {
+        "event_id": event_id,
+        "event_ts_us": event_ts_us,
+        "step": derive_step_from_ts_us(event_ts_us),
+        "account_id": account_id,
+        "dest_id": dest_id,
+        "txn_type": txn_type,
+        "amount": amount,
+        "oldbalance_org": transfer.oldbalance_org,
+        "newbalance_orig": transfer.newbalance_orig,
+        "oldbalance_dest": transfer.oldbalance_dest,
+        "newbalance_dest": transfer.newbalance_dest,
+    }
 
 
 def _single_transaction_form() -> list[dict[str, Any]] | None:
@@ -60,45 +86,50 @@ def _single_transaction_form() -> list[dict[str, Any]] | None:
             disabled=True,
             help="Auto-assigned and unique; the primary key of ops.prediction_labels.",
         )
-        values: dict[str, Any] = {}
-        cols = st.columns(2)
-        slot = 0
-        for f in dataclasses.fields(TransactionEvent):
-            if f.name in ("event_id", "event_ts_us", "step"):
-                continue
-            col = cols[slot % 2]
-            slot += 1
-            if f.name == "txn_type":
-                values[f.name] = col.selectbox("txn_type", [t.value for t in TxnType])
-                continue
-            # TransactionEvent uses `from __future__ import annotations`, so
-            # `f.type` is the string annotation, not the real type object --
-            # same assumption api_models.py's `_build_transaction_in` makes.
-            annotation = f.type
-            assert isinstance(annotation, str), (
-                "core/types.py must keep `from __future__ import annotations` for "
-                "this string-annotation assumption to hold"
-            )
-            if annotation == "float":
-                default_f = _FIELD_SAMPLE_VALUES.get(f.name, 0.0)
-                values[f.name] = float(col.number_input(f.name, value=float(default_f)))
-            else:
-                default_s = _FIELD_SAMPLE_VALUES.get(f.name, "")
-                values[f.name] = str(col.text_input(f.name, value=str(default_s)))
-
-        now_us = int(datetime.now(tz=UTC).timestamp() * 1_000_000)
-        event_ts_us = int(st.number_input("event_ts_us", value=now_us, step=1))
-        submitted = st.form_submit_button("Score")
+        account_id = st.text_input(
+            "name_orig",
+            value=str(_FIELD_SAMPLE_VALUES["account_id"]),
+            help="Sending account. Auto-provisioned with a starting balance on first use.",
+        )
+        dest_id = st.text_input(
+            "name_dest",
+            value=str(_FIELD_SAMPLE_VALUES["dest_id"]),
+            help="Receiving account. Auto-provisioned at a zero balance on first use.",
+        )
+        txn_type = st.selectbox("txn_type", [t.value for t in _SELECTABLE_TXN_TYPES], index=1)
+        amount = float(
+            st.number_input("amount", value=float(_FIELD_SAMPLE_VALUES["amount"]), min_value=0.01)
+        )
+        submitted = st.form_submit_button("Transfer and score")
 
     if not submitted:
         return None
 
-    row = {
-        "event_id": st.session_state.ui_event_id,
-        "event_ts_us": event_ts_us,
-        "step": derive_step_from_ts_us(event_ts_us),
-        **values,
-    }
+    event_ts_us = int(datetime.now(tz=UTC).timestamp() * 1_000_000)
+    with pg_connection() as conn:
+        try:
+            transfer = execute_transfer(
+                conn, name_orig=account_id, name_dest=dest_id, amount=amount
+            )
+        except (InsufficientBalanceError, ValueError) as exc:
+            st.error(str(exc))
+            return None
+
+    st.caption(
+        f"Transferred {amount:.2f}: {account_id} {transfer.oldbalance_org:.2f} -> "
+        f"{transfer.newbalance_orig:.2f}; {dest_id} {transfer.oldbalance_dest:.2f} -> "
+        f"{transfer.newbalance_dest:.2f}"
+    )
+
+    row = _build_transaction_row(
+        event_id=st.session_state.ui_event_id,
+        event_ts_us=event_ts_us,
+        account_id=account_id,
+        dest_id=dest_id,
+        txn_type=txn_type,
+        amount=amount,
+        transfer=transfer,
+    )
     st.session_state.ui_event_id = _new_event_id()
     return [row]
 
@@ -133,69 +164,14 @@ def _render_score_results(results: list[dict[str, Any]], *, threshold: float) ->
     df[f"decision @ {threshold:.2f}"] = (
         df["fraud_score"].ge(threshold).map({True: "FRAUD", False: "LEGIT"})
     )
-    st.dataframe(df, hide_index=True)
+    display_df = df[['event_id', 'fraud_score', f"decision @ {threshold:.2f}"]].copy()
+    st.dataframe(display_df, hide_index=True)
     server_threshold = results[0].get("decision")
     st.caption(
         f"Server threshold decision is `{server_threshold}` "
         f"(the scorer's own C3_DECISION_THRESHOLD); the column above re-derives "
         f"it locally at the slider's value."
     )
-
-
-def _render_model_registry(settings: Settings) -> None:
-    st.markdown("#### Registry — MLflow model versions")
-    try:
-        versions = list_model_versions(settings=settings)
-    except Exception as exc:
-        st.info(f"Could not list model versions: {exc}")
-        return
-    if not versions:
-        st.caption("No registered versions found.")
-        return
-
-    rows = [
-        {
-            "version": v.version,
-            "created": datetime.fromtimestamp(v.created_at_ms / 1000, tz=UTC).strftime(
-                "%Y-%m-%d %H:%M"
-            ),
-            "feature_schema_version": v.tags.get("feature_schema_version", "?"),
-            "compatible": v.compatible,
-            "aliases": ", ".join(v.aliases) or "-",
-            "run_id": v.run_id,
-        }
-        for v in versions
-    ]
-    st.dataframe(pd.DataFrame(rows), hide_index=True)
-
-    compatible_versions = [v.version for v in versions if v.compatible]
-    target = st.selectbox("Version to promote", compatible_versions)
-    if st.button("Promote to champion", disabled=not compatible_versions):
-        try:
-            promote_champion(target, settings=settings)
-        except IncompatibleModelError as exc:
-            st.error(f"Refused: {exc}")
-        else:
-            st.session_state.ui_pending_promotion = {"version": target, "requested_at": time.time()}
-
-    pending = st.session_state.get("ui_pending_promotion")
-    if pending:
-        try:
-            from conquer3.ui.scorer_client import get_model_info
-
-            served_version = get_model_info(base_url=settings.ui.scorer_url).get("version")
-        except ScorerError:
-            served_version = None
-        if served_version == pending["version"]:
-            st.success(f"scorer now serving version {pending['version']}")
-            del st.session_state["ui_pending_promotion"]
-        else:
-            elapsed = int(time.time() - pending["requested_at"])
-            st.info(
-                f"Promoted v{pending['version']} in MLflow {elapsed}s ago -- waiting for the "
-                f"scorer's own poll (≤ {settings.serving.champion_poll_s}s) plus a brief "
-                "restart. Interact with the page (or reload) to re-check."
-            )
 
 
 def render(settings: Settings, knobs: dict[str, Any]) -> None:
@@ -216,6 +192,3 @@ def render(settings: Settings, knobs: dict[str, Any]) -> None:
             st.error(str(exc))
         else:
             _render_score_results(results, threshold=knobs["threshold"])
-
-    st.divider()
-    _render_model_registry(settings)
