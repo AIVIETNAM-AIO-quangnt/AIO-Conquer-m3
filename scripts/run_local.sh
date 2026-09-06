@@ -35,6 +35,19 @@ if [ -z "${MLFLOW_TRACKING_URI:-}" ]; then
   exit 1
 fi
 
+# At boot the scorer preloads every version of every registered model (see
+# service.py's _preload_all_versions), and mlflow 3.x auto-enables a
+# presigned-URL artifact download path from /server-info. Confirmed against
+# this deployment: that URL points at the registry's own compose-internal
+# MinIO (e.g. http://storage:9000), unresolvable from a bare host outside
+# that docker network -- CLAUDE.md documents this exact failure mode, costing
+# ~90s of retries *per model version* before falling back. Forcing artifacts
+# through the tracking server instead avoids it entirely (confirmed here:
+# per-version load time drops from ~90s to ~1s). Only defaulted, not forced,
+# so an explicit `.env` value (e.g. once this deployment's MinIO is reachable
+# from wherever this script runs) still wins.
+export MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD="${MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD:-false}"
+
 SCORER_PORT="${C3_SCORER_PORT:-3000}"
 UI_PORT="${C3_UI_PORT:-8501}"
 # Explicit, not relied-on-default: keeps the ui pointed at whichever port this
@@ -59,11 +72,19 @@ echo "== starting scorer: conquer3 serve (log: $SCORER_LOG) =="
 uv run conquer3 serve >"$SCORER_LOG" 2>&1 &
 SCORER_PID=$!
 
-echo "== waiting for http://127.0.0.1:${SCORER_PORT}/readyz =="
-for _ in $(seq 1 60); do
-  if curl -fsS -o /dev/null "http://127.0.0.1:${SCORER_PORT}/readyz" 2>/dev/null; then
-    break
-  fi
+# --max-time bounds each individual probe: confirmed against this deployment
+# that the port can accept a connection before the app finishes preloading,
+# in which case an unbounded curl just hangs on that one request rather than
+# failing fast -- without it, one slow probe would silently eat into how
+# promptly a died-process is noticed below.
+#
+# No overall timeout: cold-start preloads every version of every registered
+# model (see the MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD note above), and on
+# this registry that has consistently taken longer than any fixed budget is
+# worth guessing at -- confirmed in practice, not just in theory. The only
+# thing that ends this loop early is the scorer process itself exiting.
+echo "== waiting for http://127.0.0.1:${SCORER_PORT}/readyz (no timeout -- cold start can take a while) =="
+until curl -fsS --max-time 3 -o /dev/null "http://127.0.0.1:${SCORER_PORT}/readyz" 2>/dev/null; do
   if ! kill -0 "$SCORER_PID" 2>/dev/null; then
     echo "FAIL: scorer exited before becoming ready -- log:" >&2
     cat "$SCORER_LOG" >&2
@@ -71,11 +92,6 @@ for _ in $(seq 1 60); do
   fi
   sleep 2
 done
-if ! curl -fsS -o /dev/null "http://127.0.0.1:${SCORER_PORT}/readyz" 2>/dev/null; then
-  echo "FAIL: scorer never became ready within timeout -- log:" >&2
-  cat "$SCORER_LOG" >&2
-  exit 1
-fi
 echo "  scorer: ready"
 
 echo

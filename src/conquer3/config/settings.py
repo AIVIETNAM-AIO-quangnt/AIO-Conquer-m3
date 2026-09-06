@@ -223,6 +223,15 @@ class _ServingEnv(BaseSettings):
     # never yaml (a real deployment must never pick this up from a versioned
     # default). See supervisor.py's _spawn().
     scorer_reload: bool = False
+    # Escape hatch for a registry entry whose artifact crashes the process
+    # outright (e.g. a native segfault while unpickling) -- see
+    # service.py's _preload_all_versions. A raised Python exception there is
+    # already caught and skipped; this is for the case that isn't, and the
+    # fix belongs in the registry (re-log or delete the bad version), not in
+    # code -- so this is deliberately an env-only, no-yaml-default escape
+    # hatch, not a tuning knob. Format: comma-separated "name:version" pairs,
+    # e.g. "paysim-fraud-xgb-optimal:3,other-model:5".
+    scorer_skip_versions: str = ""
 
 
 class ServingSettings(BaseModel):
@@ -230,6 +239,7 @@ class ServingSettings(BaseModel):
     scorer_port: int = 3000
     active_champion_file: str = "/models/active.json"
     scorer_reload: bool = False
+    scorer_skip_versions: str = ""
     # Everything else is yaml-sourced -- see configs/default.yaml's `serving:` section.
     decision_threshold: float = 0.5
     scorer_workers: int = 2

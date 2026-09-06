@@ -229,6 +229,21 @@ def _resolve_sklearn_champion(
     return pipe, ref, input_columns, categorical_columns
 
 
+def _parse_skip_versions(raw: str) -> frozenset[tuple[str, str]]:
+    """``"name:version,name:version"`` -> ``{(name, version), ...}``. Blank
+    entries (a trailing comma, a blank env var) are ignored rather than
+    raising -- this is an ops escape hatch, not a validated config file."""
+    pairs: set[tuple[str, str]] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, _, version = entry.partition(":")
+        if name and version:
+            pairs.add((name, version))
+    return frozenset(pairs)
+
+
 def _preload_all_versions(
     settings: Settings, model_names: list[str]
 ) -> dict[tuple[str, str], Champion]:
@@ -244,14 +259,29 @@ def _preload_all_versions(
     never fatal on its own; only an **empty** resulting pool -- nothing
     loadable across the *entire* registry -- is fatal.
 
+    ``settings.serving.scorer_skip_versions`` (``C3_SCORER_SKIP_VERSIONS``)
+    is checked *before* attempting to load each version -- confirmed against
+    the real registry that a version's artifact can crash the process
+    outright (a native segfault while unpickling, not a raised Python
+    exception), which the ``except Exception`` below can never catch since
+    the process doing the catching is what dies.
+
     Pool keyed by ``(name, version)``, not version alone: two different
     registered models can legitimately share a version number (confirmed on
     the real registry: ``paysim-fraud-lightgbm`` v3 and ``paysim_fraud_clf``
     v3 both exist).
     """
+    skip = _parse_skip_versions(settings.serving.scorer_skip_versions)
     pool: dict[tuple[str, str], Champion] = {}
     for name in model_names:
         for info in list_model_versions(name, settings=settings):
+            if (name, info.version) in skip:
+                _logger.warning(
+                    "pre-load: %s v%s in C3_SCORER_SKIP_VERSIONS, skipping without loading",
+                    name,
+                    info.version,
+                )
+                continue
             try:
                 pyfunc_model, ref = resolve_version(name, info.version, settings=settings)
                 local_dir = cached_model_dir(settings.model, ref.name, ref.version)
