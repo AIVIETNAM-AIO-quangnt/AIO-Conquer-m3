@@ -1,0 +1,46 @@
+{
+  "data_version": {
+    "csv_sha8": "955688f7",
+    "csv_bytes": 493534783,
+    "max_steps": "None",
+    "row_count": 6362620,
+    "step_min": 1,
+    "step_max": 743,
+    "fraud_rate": 0.001291
+  },
+  "by_type": [
+    {
+      "type": "TRANSFER",
+      "n_rows": 532909,
+      "n_frauds": 4097.0
+    },
+    {
+      "type": "PAYMENT",
+      "n_rows": 2151495,
+      "n_frauds": 0.0
+    },
+    {
+      "type": "DEBIT",
+      "n_rows": 41432,
+      "n_frauds": 0.0
+    },
+    {
+      "type": "CASH_OUT",
+      "n_rows": 2237500,
+      "n_frauds": 4116.0
+    },
+    {
+      "type": "CASH_IN",
+      "n_rows": 1399284,
+      "n_frauds": 0.0
+    }
+  ],
+  "forbidden_inputs": [
+    "isFraud",
+    "isFlaggedFraud",
+    "oldbalanceOrg",
+    "newbalanceOrig",
+    "oldbalanceDest",
+    "newbalanceDest"
+  ]
+}

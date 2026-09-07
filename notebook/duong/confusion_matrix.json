@@ -1,0 +1,20 @@
+{
+  "labels": [
+    0,
+    1
+  ],
+  "matrix": [
+    [
+      67370,
+      10151
+    ],
+    [
+      327,
+      853
+    ]
+  ],
+  "confusion_tn": 67370,
+  "confusion_fp": 10151,
+  "confusion_fn": 327,
+  "confusion_tp": 853
+}

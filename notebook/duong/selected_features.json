@@ -1,0 +1,15 @@
+{
+  "features": [
+    "current_amount",
+    "transaction_type_transfer",
+    "pit_prior_count_1h",
+    "pit_prior_amount_1h",
+    "pit_prior_count_24h",
+    "pit_prior_amount_24h",
+    "pit_prior_amount_168h",
+    "pit_distinct_senders_24h",
+    "pit_distinct_senders_168h",
+    "pit_steps_since_last_event"
+  ],
+  "source": "nb02-history-full"
+}
