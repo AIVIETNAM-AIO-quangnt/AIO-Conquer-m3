@@ -1,0 +1,39 @@
+{
+  "pipeline": "DCAI official: Step2 (6 features) → Step3 (walk-forward CV) → SHAP → Step 5b (threshold tuning Fβ(1.75)) → MLflow",
+  "model": "DecisionTreeClassifier",
+  "params": {
+    "max_depth": 6,
+    "min_samples_leaf": 50,
+    "min_samples_split": 100,
+    "class_weight": "balanced",
+    "random_state": 42
+  },
+  "features_final": [
+    "hour_day",
+    "type_code",
+    "is_customer_dest",
+    "dest_freq",
+    "dest_amount_mean",
+    "dest_type_count"
+  ],
+  "n_features": 6,
+  "beta": 1.75,
+  "baseline_threshold": 0.988243,
+  "test_metrics_baseline": {
+    "roc_auc": 0.927549657166215,
+    "confusion_tn": 1268752,
+    "confusion_fp": 2129,
+    "confusion_fn": 1104,
+    "confusion_tp": 539,
+    "precision": 0.202023988005997,
+    "recall": 0.3280584297017651,
+    "f1": 0.25005799118533983,
+    "accuracy": 0.9974593799409677,
+    "pr_auc": 0.16319987606675251
+  },
+  "mlflow": {
+    "run_id": "c13a3b3f8bbd447485c80c27c98e3a54",
+    "registered_model": "paysim-fraud-decision_tree",
+    "model_uri": "models:/m-18db6bfccb0a4bd790de4e444c6e699b"
+  }
+}
